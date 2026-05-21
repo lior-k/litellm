@@ -103,6 +103,7 @@ class SupportedGuardrailIntegrations(Enum):
     MCP_JWT_SIGNER = "mcp_jwt_signer"
     LLM_AS_A_JUDGE = "llm_as_a_judge"
     QOSTODIAN_NEXUS = "qostodian_nexus"
+    RUBRIK = "rubrik"
     ALICE_WONDERFENCE = "alice_wonderfence"
 
 
@@ -634,6 +635,16 @@ class BaseLitellmParams(
             "evaluation inputs (texts and structured_messages). When False, system "
             "messages are included even if litellm_settings sets a global skip. When "
             "None, use the global litellm.skip_system_message_in_guardrail setting."
+        ),
+    )
+
+    skip_tool_message_in_guardrail: Optional[bool] = Field(
+        default=None,
+        description=(
+            "When True, unified guardrails skip tool-role messages when building "
+            "evaluation inputs (texts and structured_messages). When False, tool "
+            "messages are included even if litellm_settings sets a global skip. When "
+            "None, use the global litellm.skip_tool_message_in_guardrail setting."
         ),
     )
 

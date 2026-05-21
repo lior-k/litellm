@@ -740,7 +740,7 @@ def generic_response_convertor(
 
     all_teams = []
     if sso_jwt_handler is not None:
-        team_ids = sso_jwt_handler.get_team_ids_from_jwt(cast(dict, response))
+        team_ids = sso_jwt_handler.get_all_jwt_team_ids(cast(dict, response))
         all_teams.extend(team_ids)
 
     if team_mappings is not None and team_mappings.team_ids_jwt_field is not None:
@@ -755,7 +755,7 @@ def generic_response_convertor(
                 f"Loaded team_ids from DB team_mappings.team_ids_jwt_field='{team_mappings.team_ids_jwt_field}': {team_ids_from_db_mapping}"
             )
     else:
-        team_ids = jwt_handler.get_team_ids_from_jwt(cast(dict, response))
+        team_ids = jwt_handler.get_all_jwt_team_ids(cast(dict, response))
         all_teams.extend(team_ids)
 
     # Determine user role based on role_mappings if available
@@ -1798,7 +1798,10 @@ async def cli_sso_callback(
 
         from fastapi.responses import HTMLResponse
 
-        verify_url = str(request.url_for("cli_sso_complete", login_id=key))
+        verify_url = get_custom_url(
+            request_base_url=str(request.base_url),
+            route=f"sso/cli/complete/{key}",
+        )
         html_content = _render_cli_sso_verification_page(
             verify_url=verify_url,
             browser_complete_token=browser_complete_token,
@@ -4078,6 +4081,8 @@ async def debug_sso_callback(request: Request):
         redirect_url += "/sso/debug/callback"
 
     result = None
+    received_response: Optional[dict] = None
+    access_token_payload: Optional[dict] = None
     if google_client_id is not None:
         result = await GoogleSSOHandler.get_google_callback_response(
             request=request,
@@ -4094,12 +4099,14 @@ async def debug_sso_callback(request: Request):
         )
 
     elif generic_client_id is not None:
-        result, _, _ = await get_generic_sso_response(
-            request=request,
-            jwt_handler=jwt_handler,
-            generic_client_id=generic_client_id,
-            redirect_url=redirect_url,
-            sso_jwt_handler=sso_jwt_handler,
+        result, received_response, access_token_payload = (
+            await get_generic_sso_response(
+                request=request,
+                jwt_handler=jwt_handler,
+                generic_client_id=generic_client_id,
+                redirect_url=redirect_url,
+                sso_jwt_handler=sso_jwt_handler,
+            )
         )
 
     # If result is None, return a basic error message
@@ -4128,10 +4135,32 @@ async def debug_sso_callback(request: Request):
                 except Exception as e:
                     filtered_result[key] = f"Complex value (not displayable): {str(e)}"
 
+    # Defense-in-depth: ensure no bearer tokens leak into the rendered HTML even if
+    # a non-conforming IdP places them in its userinfo response.
+    safe_raw_claims = {
+        k: v
+        for k, v in (received_response or {}).items()
+        if k not in _OAUTH_TOKEN_FIELDS
+    }
+    safe_access_token_claims = {
+        k: v
+        for k, v in (access_token_payload or {}).items()
+        if k not in _OAUTH_TOKEN_FIELDS
+    }
+
+    sso_payload = {
+        "parsed_by_proxy": filtered_result,
+        "raw_claims": safe_raw_claims,
+        "access_token_claims": safe_access_token_claims,
+    }
+
     # Replace the placeholder in the template with the actual data
+    sso_payload_json = json.dumps(sso_payload, indent=2, default=str).replace(
+        "</", "<\\/"
+    )
     html_content = jwt_display_template.replace(
-        "const userData = SSO_DATA;",
-        f"const userData = {json.dumps(filtered_result, indent=2)};",
+        "const ssoData = SSO_DATA;",
+        f"const ssoData = {sso_payload_json};",
     )
 
     return HTMLResponse(content=html_content)
