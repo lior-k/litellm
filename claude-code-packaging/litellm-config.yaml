@@ -1,15 +1,37 @@
 # LiteLLM Proxy — Claude Code via Alice WonderFence guardrail → Bedrock Opus 4.7
 
 model_list:
+  # All known Claude Code default model names are aliased to Bedrock Opus 4.7.
+  # Claude Code picks model names internally (ANTHROPIC_MODEL is only the
+  # initial default — `/model` and version upgrades can switch it), so we
+  # accept whatever it asks for and route to Opus 4.7.
   - model_name: claude-opus-4-7
     litellm_params:
       model: bedrock/converse/us.anthropic.claude-opus-4-7
       aws_region_name: os.environ/AWS_REGION
-
-  # Small/fast model used by Claude Code for cheap operations.
-  # Routed to the same Opus model for simplicity; swap to a Haiku/Sonnet
-  # Bedrock entry if you want cheaper completions.
+  - model_name: claude-opus-4-6
+    litellm_params:
+      model: bedrock/converse/us.anthropic.claude-opus-4-7
+      aws_region_name: os.environ/AWS_REGION
+  - model_name: claude-sonnet-4-7
+    litellm_params:
+      model: bedrock/converse/us.anthropic.claude-opus-4-7
+      aws_region_name: os.environ/AWS_REGION
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: bedrock/converse/us.anthropic.claude-opus-4-7
+      aws_region_name: os.environ/AWS_REGION
+  - model_name: claude-sonnet-4-5
+    litellm_params:
+      model: bedrock/converse/us.anthropic.claude-opus-4-7
+      aws_region_name: os.environ/AWS_REGION
   - model_name: claude-haiku-4-5
+    litellm_params:
+      model: bedrock/converse/us.anthropic.claude-opus-4-7
+      aws_region_name: os.environ/AWS_REGION
+
+  # Catch-all: anything else Claude Code asks for also routes to Opus 4.7.
+  - model_name: "*"
     litellm_params:
       model: bedrock/converse/us.anthropic.claude-opus-4-7
       aws_region_name: os.environ/AWS_REGION
