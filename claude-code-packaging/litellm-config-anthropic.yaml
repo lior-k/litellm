@@ -1,0 +1,56 @@
+# LiteLLM Proxy — Claude Code via Alice WonderFence guardrail → Anthropic API direct
+#
+# Used when start.sh runs with --anthropic or PROVIDER=anthropic in .env.
+# Billed directly to your Anthropic account (separate from Claude Code subscription).
+
+model_list:
+  # Opus family → latest Opus
+  - model_name: claude-opus-4-7
+    litellm_params:
+      model: anthropic/claude-opus-4-7
+      api_key: os.environ/ANTHROPIC_API_KEY
+  - model_name: claude-opus-4-6
+    litellm_params:
+      model: anthropic/claude-opus-4-7
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  # Sonnet family → latest Sonnet
+  - model_name: claude-sonnet-4-7
+    litellm_params:
+      model: anthropic/claude-sonnet-4-6
+      api_key: os.environ/ANTHROPIC_API_KEY
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: anthropic/claude-sonnet-4-6
+      api_key: os.environ/ANTHROPIC_API_KEY
+  - model_name: claude-sonnet-4-5
+    litellm_params:
+      model: anthropic/claude-sonnet-4-6
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  # Haiku family → latest Haiku
+  - model_name: claude-haiku-4-5
+    litellm_params:
+      model: anthropic/claude-haiku-4-5-20251001
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  # Catch-all: unknown model names route to latest Opus.
+  - model_name: "*"
+    litellm_params:
+      model: anthropic/claude-opus-4-7
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+guardrails:
+  - guardrail_name: wonderfence
+    litellm_params:
+      guardrail: wonderfence_guardrail.WonderFenceGuardrail
+      mode: [pre_call, post_call]
+      api_key: os.environ/WONDERFENCE_API_KEY
+      app_id: os.environ/WONDERFENCE_APP_ID
+      fail_open: false
+      block_message: "Content blocked by Alice WonderFence safety policy"
+      default_on: true
+      debug: false
+
+litellm_settings:
+  drop_params: true

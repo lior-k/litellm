@@ -3,21 +3,29 @@
 This directory packages a local [LiteLLM](https://github.com/BerriAI/litellm)
 proxy + the Alice **WonderFence** content-safety guardrail and a thin wrapper
 (`alice-claude`) that routes [Claude Code](https://docs.anthropic.com/claude/docs/claude-code)
-through them to **AWS Bedrock Claude Opus 4.7**.
+through them to either **AWS Bedrock Claude Opus 4.7** or the **Anthropic
+API direct** (latest Opus / Sonnet / Haiku).
 
 ```
-┌──────────────┐  http://127.0.0.1:4000  ┌────────────────────────┐  AWS  ┌──────────────────────┐
-│ Claude Code  │ ─────────────────────▶ │ LiteLLM + WonderFence  │ ────▶ │ Bedrock Opus 4.7     │
-│ (alice-claude)│                       │  (this directory)      │       │ us-west-2            │
-└──────────────┘                        └────────────────────────┘       └──────────────────────┘
+┌──────────────┐  http://127.0.0.1:4000  ┌────────────────────────┐         ┌──────────────────────┐
+│ Claude Code  │ ─────────────────────▶ │ LiteLLM + WonderFence  │ ──┬───▶  │ Bedrock Opus 4.7     │
+│(alice-claude)│                        │ (this directory)        │   │     │ us-west-2            │
+└──────────────┘                        └────────────────────────┘   │     └──────────────────────┘
+                                                                      └──▶  ┌──────────────────────┐
+                                                                            │ Anthropic API direct │
+                                                                            │ (latest Opus/Sonnet) │
+                                                                            └──────────────────────┘
 ```
+
+Provider is chosen at install (or per-run via `./start.sh --bedrock | --anthropic`).
 
 ## Prerequisites
 
 - macOS (Apple Silicon or Intel)
 - Claude Code CLI installed (`claude` on PATH)
-- AWS SSO access to the AF dev/sandbox account (you can run `login_dev`)
-- WonderFence API key + App ID (UUID)
+- WonderFence API key + App ID (UUID) — required for both providers
+- **Bedrock:** AWS SSO access to an AF account with Bedrock Opus 4.7 (you can run `login_dev`)
+- **Anthropic:** a real Anthropic API key (`sk-ant-...` from console.anthropic.com)
 
 ## Install
 
@@ -31,11 +39,13 @@ cd litellm/claude-code-packaging
 1. Install [`uv`](https://github.com/astral-sh/uv) if missing.
 2. Create an isolated venv at `~/.alice-litellm/venv`.
 3. `uv pip install` LiteLLM + WonderFence SDK + boto3.
-4. Prompt for `WONDERFENCE_API_KEY` and `WONDERFENCE_APP_ID`, written to
-   `~/.alice-litellm/.env` (mode 600).
-5. Verify AWS creds via `boto3 sts.get_caller_identity()` — if expired,
-   tell you to run `login_dev`.
-6. Symlink `alice-claude` onto PATH (`/usr/local/bin`, `/opt/homebrew/bin`,
+4. **Ask which provider** (Bedrock or Anthropic — no default, you must choose).
+5. Prompt for `WONDERFENCE_API_KEY` + `WONDERFENCE_APP_ID`. Then, depending
+   on the provider, either `ANTHROPIC_API_KEY` or just `AWS_REGION` (default
+   `us-west-2`). All written to `~/.alice-litellm/.env` (mode 600).
+6. Provider preflight — for Bedrock, runs `boto3 sts.get_caller_identity()`
+   and tells you to `login_dev` if expired. For Anthropic, skipped.
+7. Symlink `alice-claude` onto PATH (`/usr/local/bin`, `/opt/homebrew/bin`,
    or `~/.local/bin` — whichever is writable).
 
 ## Run
@@ -44,16 +54,26 @@ cd litellm/claude-code-packaging
 
 ```bash
 # Terminal A — LiteLLM proxy (foreground)
-login_dev                # if AWS token expired
+login_dev                       # only needed for Bedrock, if AWS token expired
 cd path/to/litellm/claude-code-packaging
-./start.sh               # binds 127.0.0.1:4000
+./start.sh                      # uses PROVIDER from .env
+# Or override per-run:
+./start.sh --bedrock
+./start.sh --anthropic
 
 # Terminal B — Claude Code via guardrail
-alice-claude             # exact same flags as `claude`
+alice-claude                    # exact same flags as `claude`
 ```
 
 `alice-claude` pings the proxy's `/health/liveliness` before exec'ing
 `claude`; if the proxy isn't up it tells you to start it.
+
+## Switching providers
+
+The `.env` `PROVIDER=` line is the persistent default. To switch for a
+single proxy run, pass `--bedrock` or `--anthropic` to `start.sh`. To
+switch persistently, edit `~/.alice-litellm/.env` (or just re-run
+`./install.sh` and pick the other one).
 
 ## What WonderFence does to your traffic
 
@@ -79,12 +99,13 @@ Blocked requests return:
 
 | File | What |
 |---|---|
-| `litellm-config.yaml` | LiteLLM model list + guardrail wiring (renamed from `config.yaml` because litellm's root `.gitignore` excludes that name) |
+| `litellm-config-bedrock.yaml` | LiteLLM config — all Claude Code model names route to Bedrock Opus 4.7 |
+| `litellm-config-anthropic.yaml` | LiteLLM config — Opus/Sonnet/Haiku families route to their latest Anthropic-direct counterparts |
 | `~/.alice-litellm/.env` | `WONDERFENCE_API_KEY`, `WONDERFENCE_APP_ID`, `AWS_REGION` |
 | `~/.alice-litellm/messages/` | Per-request dumps (debug; auto-created, gitignored) |
 | `wonderfence_guardrail.py` | The guardrail implementation |
 
-To use a different Bedrock model, edit `litellm-config.yaml`. To suppress request
+To use a different model, edit the relevant `litellm-config-*.yaml`. To suppress request
 dumps, set `WONDERFENCE_MESSAGES_DIR=/dev/null` in the env file (or
 delete the dir periodically).
 
