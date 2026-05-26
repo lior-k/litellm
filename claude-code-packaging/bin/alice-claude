@@ -1,0 +1,24 @@
+#!/bin/bash
+# alice-claude — wrapper that routes Claude Code through the local LiteLLM proxy
+# (with Alice WonderFence guardrail) to Bedrock Claude Opus 4.7.
+#
+# Requires `./start.sh` running in another terminal on 127.0.0.1:4000.
+
+set -e
+
+PROXY_URL="${ALICE_PROXY_URL:-http://127.0.0.1:4000}"
+
+# Quick liveness check — fail fast with a useful message.
+if ! curl -fsS -o /dev/null --max-time 2 "$PROXY_URL/health/liveliness" 2>/dev/null; then
+    echo "[alice-claude] LiteLLM proxy not reachable at $PROXY_URL" >&2
+    echo "[alice-claude] Start it in another terminal:" >&2
+    echo "    cd $(dirname "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")") && ./start.sh" >&2
+    exit 1
+fi
+
+ANTHROPIC_BASE_URL="$PROXY_URL" \
+ANTHROPIC_API_KEY=dummy \
+CLAUDE_CODE_DISABLE_NONAPI_AUTH=1 \
+ANTHROPIC_MODEL=claude-opus-4-7 \
+ANTHROPIC_SMALL_FAST_MODEL=claude-haiku-4-5 \
+exec claude "$@"

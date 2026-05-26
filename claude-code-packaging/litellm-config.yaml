@@ -1,0 +1,30 @@
+# LiteLLM Proxy — Claude Code via Alice WonderFence guardrail → Bedrock Opus 4.7
+
+model_list:
+  - model_name: claude-opus-4-7
+    litellm_params:
+      model: bedrock/converse/us.anthropic.claude-opus-4-7
+      aws_region_name: os.environ/AWS_REGION
+
+  # Small/fast model used by Claude Code for cheap operations.
+  # Routed to the same Opus model for simplicity; swap to a Haiku/Sonnet
+  # Bedrock entry if you want cheaper completions.
+  - model_name: claude-haiku-4-5
+    litellm_params:
+      model: bedrock/converse/us.anthropic.claude-opus-4-7
+      aws_region_name: os.environ/AWS_REGION
+
+guardrails:
+  - guardrail_name: wonderfence
+    litellm_params:
+      guardrail: wonderfence_guardrail.WonderFenceGuardrail
+      mode: [pre_call, post_call]
+      api_key: os.environ/WONDERFENCE_API_KEY
+      app_id: os.environ/WONDERFENCE_APP_ID
+      fail_open: false
+      block_message: "Content blocked by Alice WonderFence safety policy"
+      default_on: true
+      debug: false
+
+litellm_settings:
+  drop_params: true
