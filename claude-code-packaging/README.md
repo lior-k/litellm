@@ -82,6 +82,24 @@ switch persistently, edit `~/.alice-litellm/.env` (or just re-run
 | `pre_call` | Before the prompt reaches Bedrock | BLOCK → 400 to Claude Code; MASK → prompt rewritten |
 | `post_call` | After Bedrock responds, before reply reaches Claude Code | BLOCK → 400; MASK → response rewritten |
 
+### Rolling 10K buffer
+
+On both sides, WonderFence sees a **rolling 10 000-byte window** of recent text.
+
+- **Request:** all `role: user` messages are concatenated reverse-chrono, then
+  trimmed to the last 10 KB (UTF-8-safe). That single buffer goes to
+  `evaluate_prompt` — no longer just the last 100 chars of the latest message.
+- **Streaming response:** chunks accumulate into a rolling 10 KB buffer.
+  `evaluate_response` fires at most once per chunk, and only after at least
+  `WONDERFENCE_EVAL_BYTES_INCREMENT` bytes (default 200) have arrived since
+  the previous eval. A mid-stream BLOCK closes the stream with a
+  wire-format error frame (Anthropic SSE or OpenAI `content_filter` chunk).
+  Mid-stream MASK is unenforceable for already-released text and logs a
+  WARN.
+
+Tune with `WONDERFENCE_BUFFER_BYTES` and `WONDERFENCE_EVAL_BYTES_INCREMENT`
+in `~/.alice-litellm/.env`.
+
 Blocked requests return:
 
 ```json
