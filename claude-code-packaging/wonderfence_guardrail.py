@@ -12,7 +12,6 @@ import logging
 import os
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncGenerator
 
@@ -37,6 +36,9 @@ MESSAGES_DIR = Path(
 
 BUFFER_MAX_BYTES = int(os.environ.get("WONDERFENCE_BUFFER_BYTES", "10000"))
 EVAL_BYTES_INCREMENT = int(os.environ.get("WONDERFENCE_EVAL_BYTES_INCREMENT", "200"))
+RESPONSE_SECTION_OVERLAP_BYTES = int(
+    os.environ.get("WONDERFENCE_RESPONSE_SECTION_OVERLAP_BYTES", "100")
+)
 
 
 def _tail_bytes_utf8(text: str, max_bytes: int) -> str:
@@ -47,18 +49,49 @@ def _tail_bytes_utf8(text: str, max_bytes: int) -> str:
     return encoded[-max_bytes:].decode("utf-8", errors="ignore")
 
 
-@dataclass
+def _split_overlapping_utf8(
+    text: str, max_bytes: int, overlap_bytes: int
+) -> list[str]:
+    """Split `text` into <= `max_bytes` UTF-8 sections that overlap by
+    `overlap_bytes`, so a detection straddling a section boundary isn't missed.
+
+    Sections step by `max_bytes - overlap_bytes`. Byte-window cuts use
+    errors='ignore' so a split codepoint at either edge is dropped rather than
+    corrupting the section. Returns `[text]` when it already fits.
+    """
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return [text]
+    step = max(1, max_bytes - overlap_bytes)
+    sections: list[str] = []
+    start = 0
+    n = len(encoded)
+    while start < n:
+        sections.append(encoded[start : start + max_bytes].decode("utf-8", errors="ignore"))
+        if start + max_bytes >= n:
+            break
+        start += step
+    return sections
+
+
 class _RollingBuffer:
     """Per-request rolling byte buffer for streaming response eval.
 
     `append_text` keeps only the last `max_bytes` and tracks bytes added since
     the last `mark_evaluated()`. `needs_eval()` flips true once that delta
     crosses `eval_increment` — one eval per chunk regardless of chunk size.
+
+    Plain class (not @dataclass): this module is loaded dynamically by LiteLLM
+    via spec.loader.exec_module() and never registered in sys.modules, so
+    Python 3.13's dataclass machinery crashes resolving string annotations
+    (from __future__ import annotations) via sys.modules.get(__module__).
     """
-    max_bytes: int
-    eval_increment: int
-    _buf: bytes = field(default=b"")
-    _since_eval: int = 0
+
+    def __init__(self, max_bytes: int, eval_increment: int) -> None:
+        self.max_bytes = max_bytes
+        self.eval_increment = eval_increment
+        self._buf: bytes = b""
+        self._since_eval: int = 0
 
     def append_text(self, text: str) -> None:
         chunk = text.encode("utf-8")
@@ -553,30 +586,22 @@ class WonderFenceGuardrail(CustomGuardrail):
         return str(content) if content else ""
 
     def _collect_user_buffer(self, data: dict[str, Any]) -> str:
-        """Walk messages reverse-chrono, concat user-role text, return the
-        UTF-8-safe suffix that fits in BUFFER_MAX_BYTES.
+        """Return the latest user message text, UTF-8-trimmed to BUFFER_MAX_BYTES.
 
-        Walks newest→oldest so the most recent user content is preserved when
-        the buffer is full. The returned string is in chronological order
-        (oldest kept message first, newest last).
+        Only the most recent user-role message is sent to WonderFence — not the
+        concatenated history. Handles string content, text blocks, and
+        tool_result blocks. If the newest user message has no text, scans older
+        ones until it finds text (e.g. an image-only turn is skipped).
         """
         messages = data.get("messages", []) or []
-        collected: list[str] = []
-        size = 0
         for message in reversed(messages):
             if message.get("role") != "user":
                 continue
             text = self._message_text(message)
             if not text:
                 continue
-            collected.append(text)
-            size += len(text.encode("utf-8"))
-            if size >= BUFFER_MAX_BYTES:
-                break
-        if not collected:
-            return ""
-        joined = "\n".join(reversed(collected))
-        return _tail_bytes_utf8(joined, BUFFER_MAX_BYTES)
+            return _tail_bytes_utf8(text, BUFFER_MAX_BYTES)
+        return ""
 
     def _extract_response_content(self, response: ModelResponse) -> str:
         """Extract content from the first choice in the response.
@@ -929,21 +954,62 @@ class WonderFenceGuardrail(CustomGuardrail):
         user_api_key_dict: UserAPIKeyAuth,
         hook_name: str,
     ) -> str:
-        """Send response text to WonderFence and return possibly-modified content."""
+        """Send response text to WonderFence and return possibly-modified content.
+
+        Responses larger than BUFFER_MAX_BYTES are split into overlapping
+        sections (overlap = RESPONSE_SECTION_OVERLAP_BYTES) and each section is
+        evaluated, so detections past the first 10K aren't missed. A BLOCK on
+        any section raises (blocks the whole response). MASK across multiple
+        sections is reassembled best-effort.
+        """
         api_key = self._resolve_api_key(data, user_api_key_dict)
         app_id = self._resolve_app_id(data, user_api_key_dict)
         client = await self._get_client(api_key)
         context = self._build_analysis_context(data)
 
+        sections = _split_overlapping_utf8(
+            response_content, BUFFER_MAX_BYTES, RESPONSE_SECTION_OVERLAP_BYTES
+        )
         logger.debug(
-            "WonderFence %s sending to evaluate_response (app_id=%s, context=%s, len=%d): %s",
-            hook_name, app_id, context, len(response_content), response_content,
+            "WonderFence %s sending to evaluate_response "
+            "(app_id=%s, context=%s, len=%d, sections=%d)",
+            hook_name, app_id, context, len(response_content), len(sections),
         )
-        response_content = response_content[:10240]
-        result = await client.evaluate_response(
-            app_id=app_id, response=response_content, context=context, custom_fields=None
+
+        if len(sections) == 1:
+            result = await client.evaluate_response(
+                app_id=app_id, response=sections[0], context=context, custom_fields=None
+            )
+            return self._handle_evaluation_result(result, "response", sections[0])
+
+        handled_parts: list[str] = []
+        masked_any = False
+        for i, section in enumerate(sections):
+            logger.debug(
+                "WonderFence %s evaluate_response section %d/%d (len=%d)",
+                hook_name, i + 1, len(sections), len(section),
+            )
+            result = await client.evaluate_response(
+                app_id=app_id, response=section, context=context, custom_fields=None
+            )
+            handled = self._handle_evaluation_result(result, "response", section)
+            if handled != section:
+                masked_any = True
+            handled_parts.append(handled)
+
+        if not masked_any:
+            return response_content
+
+        logger.warning(
+            "WonderFence %s: MASK across %d sections — reassembling best-effort "
+            "(overlap=%d bytes)",
+            hook_name, len(sections), RESPONSE_SECTION_OVERLAP_BYTES,
         )
-        return self._handle_evaluation_result(result, "response", response_content)
+        reassembled = handled_parts[0]
+        for part in handled_parts[1:]:
+            trimmed = part.encode("utf-8")[RESPONSE_SECTION_OVERLAP_BYTES:]
+            reassembled += trimmed.decode("utf-8", errors="ignore")
+        return reassembled
 
     @staticmethod
     def _apply_post_call_replacements(text: str) -> str:

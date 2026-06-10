@@ -21,7 +21,7 @@ Provider is chosen at install (or per-run via `./start.sh --bedrock | --anthropi
 
 ## Prerequisites
 
-- macOS (Apple Silicon or Intel)
+- macOS
 - Claude Code CLI installed (`claude` on PATH)
 - WonderFence API key + App ID (UUID) — required for both providers
 - **Bedrock:** AWS SSO access to an AF account with Bedrock Opus 4.7 (you can run `login_dev`)
@@ -54,7 +54,7 @@ cd litellm/claude-code-packaging
 
 ```bash
 # Terminal A — LiteLLM proxy (foreground)
-login_dev                       # only needed for Bedrock, if AWS token expired
+login_aws_dev                   # only needed for Bedrock, if AWS token expired
 cd path/to/litellm/claude-code-packaging
 ./start.sh                      # uses PROVIDER from .env
 # Or override per-run:
@@ -82,13 +82,17 @@ switch persistently, edit `~/.alice-litellm/.env` (or just re-run
 | `pre_call` | Before the prompt reaches Bedrock | BLOCK → 400 to Claude Code; MASK → prompt rewritten |
 | `post_call` | After Bedrock responds, before reply reaches Claude Code | BLOCK → 400; MASK → response rewritten |
 
-### Rolling 10K buffer
+### What gets sent to WonderFence
 
-On both sides, WonderFence sees a **rolling 10 000-byte window** of recent text.
+The unit of text sent for evaluation is **10 000 bytes** (UTF-8-safe).
 
-- **Request:** all `role: user` messages are concatenated reverse-chrono, then
-  trimmed to the last 10 KB (UTF-8-safe). That single buffer goes to
-  `evaluate_prompt` — no longer just the last 100 chars of the latest message.
+- **Request:** only the **latest** user message goes to `evaluate_prompt`
+  (not the whole conversation). If it exceeds 10 KB it is tail-trimmed to the
+  last 10 KB.
+- **Non-streaming response:** the full response is split into **10 KB sections
+  with a 100-byte overlap** and every section is evaluated, so a detection past
+  the first 10 KB isn't missed. BLOCK on any section → 400 for the whole
+  response; MASK across sections is reassembled best-effort.
 - **Streaming response:** chunks accumulate into a rolling 10 KB buffer.
   `evaluate_response` fires at most once per chunk, and only after at least
   `WONDERFENCE_EVAL_BYTES_INCREMENT` bytes (default 200) have arrived since
@@ -97,8 +101,8 @@ On both sides, WonderFence sees a **rolling 10 000-byte window** of recent text.
   Mid-stream MASK is unenforceable for already-released text and logs a
   WARN.
 
-Tune with `WONDERFENCE_BUFFER_BYTES` and `WONDERFENCE_EVAL_BYTES_INCREMENT`
-in `~/.alice-litellm/.env`.
+Tune with `WONDERFENCE_BUFFER_BYTES`, `WONDERFENCE_EVAL_BYTES_INCREMENT`, and
+`WONDERFENCE_RESPONSE_SECTION_OVERLAP_BYTES` in `~/.alice-litellm/.env`.
 
 Blocked requests return:
 
@@ -123,9 +127,24 @@ Blocked requests return:
 | `~/.alice-litellm/messages/` | Per-request dumps (debug; auto-created, gitignored) |
 | `wonderfence_guardrail.py` | The guardrail implementation |
 
-To use a different model, edit the relevant `litellm-config-*.yaml`. To suppress request
-dumps, set `WONDERFENCE_MESSAGES_DIR=/dev/null` in the env file (or
-delete the dir periodically).
+To use a different model, edit the relevant `litellm-config-*.yaml`.
+
+### Per-request message dumps
+
+Every request/response is dumped (for debug / replay) to:
+
+```
+~/.alice-litellm/messages/
+```
+
+Filenames are `<timestamp>[_<session_id>]_<hook_name>.{json,txt,jsonl}` —
+one set per hook (`pre_call`, `during_call`, `post_call`, `post_call_stream`,
+`post_call_stream_final`, etc.) plus per-chunk logs for streamed responses
+(`*_chunks_text.jsonl`, `*_chunks_raw.jsonl`, `*_latest.txt`).
+
+Override the location with `WONDERFENCE_MESSAGES_DIR=/some/path` in
+`~/.alice-litellm/.env`, or set it to `/dev/null` to suppress dumps. The
+directory is auto-created and gitignored — clear it periodically if it grows.
 
 ## Troubleshooting
 

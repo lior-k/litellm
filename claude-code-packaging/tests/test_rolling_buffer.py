@@ -102,10 +102,8 @@ def test_tail_bytes_utf8_no_partial_codepoint():
 # --------------------------- _collect_user_buffer (request side) ---------
 
 
-@pytest.mark.asyncio
-async def test_evaluate_prompt_sends_rolling_buffer(guardrail, mock_client):
-    """5 user messages × 6000 chars = 30KB → prompt arg is last 10000 bytes UTF-8."""
-    result = type(
+def _allow_result():
+    return type(
         "R",
         (),
         {
@@ -115,10 +113,17 @@ async def test_evaluate_prompt_sends_rolling_buffer(guardrail, mock_client):
             "correlation_id": "c-1",
         },
     )()
-    mock_client.evaluate_prompt = AsyncMock(return_value=result)
+
+
+@pytest.mark.asyncio
+async def test_evaluate_prompt_sends_latest_message_only(guardrail, mock_client):
+    """Only the latest user message goes to WonderFence, not prior history."""
+    mock_client.evaluate_prompt = AsyncMock(return_value=_allow_result())
 
     messages = [
-        {"role": "user", "content": f"msg{i}-" + ("x" * 5_994)} for i in range(5)
+        {"role": "user", "content": "OLD-" + ("a" * 2_000)},
+        {"role": "assistant", "content": "reply"},
+        {"role": "user", "content": "LATEST-" + ("b" * 2_000)},
     ]
     data = {"model": "gpt-4", "messages": messages}
 
@@ -126,16 +131,31 @@ async def test_evaluate_prompt_sends_rolling_buffer(guardrail, mock_client):
 
     assert mock_client.evaluate_prompt.await_count == 1
     sent = mock_client.evaluate_prompt.await_args.kwargs["prompt"]
-    assert len(sent.encode("utf-8")) == 10_000
-    # Most-recent message is the one ending the joined buffer.
-    assert sent.endswith("x" * 100)
+    assert sent.startswith("LATEST-")
+    assert "OLD-" not in sent
+    assert "a" not in sent
 
 
 @pytest.mark.asyncio
-async def test_collect_user_buffer_handles_text_blocks_and_tool_result(guardrail):
+async def test_evaluate_prompt_tail_caps_large_latest_message(guardrail, mock_client):
+    """A latest message > 10K is tail-trimmed to 10000 bytes UTF-8."""
+    mock_client.evaluate_prompt = AsyncMock(return_value=_allow_result())
+
+    messages = [{"role": "user", "content": "x" * 5_000 + "y" * 10_000}]
+    data = {"model": "gpt-4", "messages": messages}
+
+    await guardrail._evaluate_prompt(data, user_api_key_dict=None, hook_name="pre_call")
+
+    sent = mock_client.evaluate_prompt.await_args.kwargs["prompt"]
+    assert len(sent.encode("utf-8")) == 10_000
+    assert sent == "y" * 10_000
+
+
+@pytest.mark.asyncio
+async def test_collect_user_buffer_latest_only_with_blocks(guardrail):
+    """Latest user message only; tool_result/text blocks flattened, prior msgs ignored."""
     data = {
         "messages": [
-            {"role": "assistant", "content": "ignored"},
             {"role": "user", "content": "first"},
             {
                 "role": "user",
@@ -150,9 +170,74 @@ async def test_collect_user_buffer_handles_text_blocks_and_tool_result(guardrail
         ],
     }
     buf = guardrail._collect_user_buffer(data)
-    assert "first" in buf
+    assert "first" not in buf
     assert "block-text" in buf
     assert "[tool_result] tr-text" in buf
+
+
+# --------------------- _split_overlapping_utf8 (response sections) ---------
+
+
+def test_split_single_section_when_under_limit():
+    from wonderfence_guardrail import _split_overlapping_utf8
+
+    assert _split_overlapping_utf8("hello", 10_000, 100) == ["hello"]
+
+
+def test_split_sections_with_overlap():
+    from wonderfence_guardrail import _split_overlapping_utf8
+
+    text = "".join(chr(ord("a") + (i % 26)) for i in range(25_000))  # 25000 bytes ascii
+    sections = _split_overlapping_utf8(text, 10_000, 100)
+    # step = 9900 → starts 0, 9900, 19800 → 3 sections
+    assert len(sections) == 3
+    assert len(sections[0].encode("utf-8")) == 10_000
+    assert len(sections[1].encode("utf-8")) == 10_000
+    assert len(sections[2].encode("utf-8")) == 25_000 - 19_800
+    # Overlap: last 100 bytes of section 0 == first 100 bytes of section 1.
+    assert sections[0][-100:] == sections[1][:100]
+
+
+def test_split_no_partial_codepoint():
+    from wonderfence_guardrail import _split_overlapping_utf8
+
+    text = "🐉" * 3_000  # 12_000 bytes
+    sections = _split_overlapping_utf8(text, 10_000, 100)
+    for sec in sections:
+        sec.encode("utf-8").decode("utf-8")  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_evaluate_response_sections_each(guardrail, mock_client):
+    """A 25K response → evaluate_response called once per section (3)."""
+    mock_client.evaluate_response = AsyncMock(return_value=_allow_result())
+
+    big = "z" * 25_000
+    out = await guardrail._evaluate_response_text(
+        big, {"model": "gpt-4"}, user_api_key_dict=None, hook_name="post_call"
+    )
+    assert mock_client.evaluate_response.await_count == 3
+    assert out == big  # nothing masked → original returned unchanged
+
+
+@pytest.mark.asyncio
+async def test_evaluate_response_block_in_later_section(guardrail, mock_client):
+    """BLOCK on the 2nd section raises HTTPException for the whole response."""
+    n = {"i": 0}
+
+    async def _block_2nd(**kwargs):
+        n["i"] += 1
+        if n["i"] == 2:
+            raise HTTPException(status_code=400, detail={"error": "blocked"})
+        return _allow_result()
+
+    mock_client.evaluate_response = AsyncMock(side_effect=_block_2nd)
+
+    with pytest.raises(HTTPException):
+        await guardrail._evaluate_response_text(
+            "z" * 25_000, {"model": "gpt-4"}, user_api_key_dict=None, hook_name="post_call"
+        )
+    assert n["i"] == 2  # stopped at the blocking section
 
 
 # --------------------------- Streaming response ---------------------------
