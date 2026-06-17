@@ -16,9 +16,21 @@ if ! curl -fsS -o /dev/null --max-time 2 "$PROXY_URL/health/liveliness" 2>/dev/n
     exit 1
 fi
 
-ANTHROPIC_BASE_URL="$PROXY_URL" \
-ANTHROPIC_API_KEY=dummy \
-CLAUDE_CODE_DISABLE_NONAPI_AUTH=1 \
-ANTHROPIC_MODEL=claude-opus-4-7 \
-ANTHROPIC_SMALL_FAST_MODEL=claude-haiku-4-5 \
-exec claude "$@"
+# Pass config as command-line args, not env vars. Env vars (and the `env` block
+# in settings.json) sit below the user's own ~/.claude/settings.json in some
+# resolution paths and can be silently overridden. `--settings` and `--model`
+# are command-line args — they outrank user settings, so our routing sticks.
+# ANTHROPIC_API_KEY is a throwaway placeholder: Claude Code refuses to start
+# without a key, but the local proxy has no master_key and ignores it. The real
+# upstream credential (Anthropic key or AWS creds) lives in the proxy's .env.
+#
+# CLAUDE_CODE_USE_BEDROCK / _USE_VERTEX = 0 force the Anthropic-API path so
+# ANTHROPIC_BASE_URL points Claude Code at our proxy. Without this, a user env
+# var or setting enabling Bedrock/Vertex would make Claude Code call the cloud
+# provider directly, bypassing our proxy + WonderFence guardrail. ("0" is falsy.)
+SETTINGS_JSON='{"env":{"ANTHROPIC_BASE_URL":"'"$PROXY_URL"'","ANTHROPIC_API_KEY":"dummy","CLAUDE_CODE_USE_BEDROCK":"0","CLAUDE_CODE_USE_VERTEX":"0","CLAUDE_CODE_DISABLE_NONAPI_AUTH":"1","ANTHROPIC_SMALL_FAST_MODEL":"claude-haiku-4-5"}}'
+
+exec claude \
+    --model claude-opus-4-7 \
+    --settings "$SETTINGS_JSON" \
+    "$@"
