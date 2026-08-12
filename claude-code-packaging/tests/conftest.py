@@ -45,14 +45,37 @@ def mock_client():
 
 
 @pytest.fixture
-def guardrail(mock_client):
-    _install_sdk_stub(client_factory=lambda **kwargs: mock_client)
-    from wonderfence_guardrail import WonderFenceGuardrail
+def make_guardrail(mock_client):
+    """Build a guardrail wired to `mock_client`, with extra ctor kwargs."""
 
-    g = WonderFenceGuardrail(
-        guardrail_name="wf-test",
-        api_key="test-key",
-        app_id="test-app",
-    )
-    g._client_cache["test-key"] = mock_client
-    return g
+    def _make(**kwargs):
+        _install_sdk_stub(client_factory=lambda **kw: mock_client)
+        from wonderfence_guardrail import WonderFenceGuardrail
+
+        g = WonderFenceGuardrail(
+            guardrail_name="wf-test",
+            api_key="test-key",
+            app_id="test-app",
+            **kwargs,
+        )
+        g._client_cache["test-key"] = mock_client
+        return g
+
+    return _make
+
+
+@pytest.fixture
+def guardrail(make_guardrail):
+    return make_guardrail()
+
+
+@pytest.fixture(autouse=True)
+def _restore_guardrail_logger():
+    """Undo _configure_logging's mutations — the logger is module-level state."""
+    from wonderfence_guardrail import logger
+
+    level, handlers, propagate = logger.level, logger.handlers[:], logger.propagate
+    yield
+    logger.setLevel(level)
+    logger.handlers[:] = handlers
+    logger.propagate = propagate

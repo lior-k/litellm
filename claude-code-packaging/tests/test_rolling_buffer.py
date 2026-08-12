@@ -1,4 +1,4 @@
-"""Unit tests for the rolling 10KB buffer (request + streaming response)."""
+"""Unit tests for the WonderFence eval buffers (request + streaming response)."""
 
 from __future__ import annotations
 
@@ -70,33 +70,62 @@ def test_rolling_buffer_utf8_boundary():
     assert set(text) == {emoji}
 
 
-# --------------------------- _tail_bytes_utf8 ---------------------------
+# --------------------------- _DeltaWindows ---------------------------
 
 
-def test_tail_bytes_utf8_under_limit():
-    from wonderfence_guardrail import _tail_bytes_utf8
+def test_delta_windows_pairs_current_and_previous():
+    from wonderfence_guardrail import _DeltaWindows
 
-    assert _tail_bytes_utf8("hello", 100) == "hello"
+    dw = _DeltaWindows(eval_increment=200)
+    dw.append_text("A" * 200)
+    assert dw.needs_eval()
+    assert dw.text() == "A" * 200  # first window has no predecessor
+    dw.mark_evaluated()
+
+    dw.append_text("B" * 200)
+    assert dw.text() == "A" * 200 + "B" * 200  # previous + current
+    dw.mark_evaluated()
+
+    dw.append_text("C" * 200)
+    assert dw.text() == "B" * 200 + "C" * 200  # "A" has rotated out
 
 
-def test_tail_bytes_utf8_trims_to_suffix():
-    from wonderfence_guardrail import _tail_bytes_utf8
+def test_delta_windows_pending_bytes_resets_on_rotation():
+    from wonderfence_guardrail import _DeltaWindows
 
-    text = "A" * 5 + "B" * 100
-    out = _tail_bytes_utf8(text, 50)
-    assert len(out.encode("utf-8")) == 50
-    assert out == "B" * 50
+    dw = _DeltaWindows(eval_increment=200)
+    dw.append_text("z" * 150)
+    assert not dw.needs_eval()
+    assert dw.pending_bytes() == 150
+    dw.append_text("z" * 50)
+    assert dw.needs_eval()
+    dw.mark_evaluated()
+    assert dw.pending_bytes() == 0
+    assert not dw.needs_eval()
 
 
-def test_tail_bytes_utf8_no_partial_codepoint():
-    from wonderfence_guardrail import _tail_bytes_utf8
+def test_delta_windows_single_oversized_chunk():
+    """One 25K chunk → one oversized text(), which the common layer then splits."""
+    from wonderfence_guardrail import _DeltaWindows
+
+    dw = _DeltaWindows(eval_increment=200)
+    dw.append_text("z" * 25_000)
+    assert dw.needs_eval()
+    assert len(dw.text().encode("utf-8")) == 25_000
+
+
+def test_delta_windows_utf8_roundtrip():
+    """Windows close on chunk boundaries, so no codepoint is ever split."""
+    from wonderfence_guardrail import _DeltaWindows
 
     emoji = "🐉"  # 4 bytes
-    text = emoji * 100
-    out = _tail_bytes_utf8(text, 10)
-    # 10 bytes = 2 full emoji + 2 garbage bytes; errors=ignore drops them.
-    assert all(ch == emoji for ch in out)
-    assert len(out.encode("utf-8")) <= 10
+    dw = _DeltaWindows(eval_increment=200)
+    dw.append_text(emoji * 51)  # 204 bytes
+    assert dw.needs_eval()
+    assert dw.text() == emoji * 51
+    dw.mark_evaluated()
+    dw.append_text(emoji * 51)
+    assert dw.text() == emoji * 102
 
 
 # --------------------------- _collect_user_text_full (request side) ------
@@ -137,18 +166,60 @@ async def test_evaluate_prompt_sends_latest_message_only(guardrail, mock_client)
 
 
 @pytest.mark.asyncio
-async def test_evaluate_prompt_tail_caps_large_latest_message(guardrail, mock_client):
-    """A latest message > 10K is tail-trimmed to 10000 bytes UTF-8."""
+async def test_evaluate_prompt_sections_large_latest_message(guardrail, mock_client):
+    """A 15K latest message is split into sections covering ALL of it — the head
+    is evaluated too, not tail-trimmed away."""
     mock_client.evaluate_prompt = AsyncMock(return_value=_allow_result())
 
-    messages = [{"role": "user", "content": "x" * 5_000 + "y" * 10_000}]
-    data = {"model": "gpt-4", "messages": messages}
+    full = "x" * 5_000 + "y" * 10_000  # 15_000 bytes
+    data = {"model": "gpt-4", "messages": [{"role": "user", "content": full}]}
 
     await guardrail._evaluate_prompt(data, user_api_key_dict=None, hook_name="pre_call")
 
-    sent = mock_client.evaluate_prompt.await_args.kwargs["prompt"]
-    assert len(sent.encode("utf-8")) == 10_000
-    assert sent == "y" * 10_000
+    # step = 10_000 - 100 → starts 0, 9_900 → 2 sections.
+    assert mock_client.evaluate_prompt.await_count == 2
+    sent = [c.kwargs["prompt"] for c in mock_client.evaluate_prompt.await_args_list]
+    assert sent[0] == full[:10_000]  # first section starts at the head
+    assert sent[0].startswith("x" * 5_000)
+    assert sent[1] == full[9_900:]
+    # Union of the sections covers every byte of the message.
+    assert sent[0] + sent[1][100:] == full
+
+
+@pytest.mark.asyncio
+async def test_evaluate_prompt_oversized_sections_each(guardrail, mock_client):
+    """A 25K latest message → 3 evaluate_prompt calls covering the whole thing."""
+    mock_client.evaluate_prompt = AsyncMock(return_value=_allow_result())
+
+    full = "".join(chr(ord("a") + (i % 26)) for i in range(25_000))
+    data = {"model": "gpt-4", "messages": [{"role": "user", "content": full}]}
+
+    await guardrail._evaluate_prompt(data, user_api_key_dict=None, hook_name="pre_call")
+
+    assert mock_client.evaluate_prompt.await_count == 3
+    sent = [c.kwargs["prompt"] for c in mock_client.evaluate_prompt.await_args_list]
+    assert sent[0] + sent[1][100:] + sent[2][100:] == full
+
+
+@pytest.mark.asyncio
+async def test_evaluate_prompt_block_in_later_section(guardrail, mock_client):
+    """BLOCK on the 2nd prompt section raises for the whole request."""
+    n = {"i": 0}
+
+    async def _block_2nd(**kwargs):
+        n["i"] += 1
+        if n["i"] == 2:
+            raise HTTPException(status_code=400, detail={"error": "blocked"})
+        return _allow_result()
+
+    mock_client.evaluate_prompt = AsyncMock(side_effect=_block_2nd)
+    data = {"model": "gpt-4", "messages": [{"role": "user", "content": "z" * 25_000}]}
+
+    with pytest.raises(HTTPException):
+        await guardrail._evaluate_prompt(
+            data, user_api_key_dict=None, hook_name="pre_call"
+        )
+    assert n["i"] == 3  # sections run in parallel — all dispatched, no short-circuit
 
 
 @pytest.mark.asyncio
@@ -280,8 +351,12 @@ async def test_evaluate_response_sections_each(guardrail, mock_client):
     mock_client.evaluate_response = AsyncMock(return_value=_allow_result())
 
     big = "z" * 25_000
-    out = await guardrail._evaluate_response_text(
-        big, {"model": "gpt-4"}, user_api_key_dict=None, hook_name="post_call"
+    out = await guardrail._evaluate_text(
+        big,
+        {"model": "gpt-4"},
+        user_api_key_dict=None,
+        hook_name="post_call",
+        kind="response",
     )
     assert mock_client.evaluate_response.await_count == 3
     assert out == big  # nothing masked → original returned unchanged
@@ -301,11 +376,12 @@ async def test_evaluate_response_block_in_later_section(guardrail, mock_client):
     mock_client.evaluate_response = AsyncMock(side_effect=_block_2nd)
 
     with pytest.raises(HTTPException):
-        await guardrail._evaluate_response_text(
+        await guardrail._evaluate_text(
             "z" * 25_000,
             {"model": "gpt-4"},
             user_api_key_dict=None,
             hook_name="post_call",
+            kind="response",
         )
     assert n["i"] == 3  # sections run in parallel — no short-circuit, all dispatched
 
@@ -332,8 +408,12 @@ async def test_evaluate_response_sections_concurrency_bounded(
 
     mock_client.evaluate_response = AsyncMock(side_effect=_track)
 
-    await guardrail._evaluate_response_text(
-        "z" * 25_000, {"model": "gpt-4"}, user_api_key_dict=None, hook_name="post_call"
+    await guardrail._evaluate_text(
+        "z" * 25_000,
+        {"model": "gpt-4"},
+        user_api_key_dict=None,
+        hook_name="post_call",
+        kind="response",
     )
     assert mock_client.evaluate_response.await_count == 3  # 3 sections
     assert state["peak"] == 2  # bounded by RESPONSE_SECTION_MAX_CONCURRENCY
@@ -490,10 +570,11 @@ def _block_on_nth_eval(n: int):
 
 
 @pytest.mark.asyncio
-async def test_gated_block_withholds_offending_batch(guardrail, mock_client):
-    """Gated mode: the batch that trips BLOCK is never yielded; earlier batches are."""
+async def test_gated_block_withholds_offending_batch(make_guardrail, mock_client):
+    """Rolling mode: the batch that trips BLOCK is never yielded; earlier ones are."""
     # 200-byte chunks → 1 eval per chunk. BLOCK on the 3rd eval.
     mock_client.evaluate_response = AsyncMock(side_effect=_block_on_nth_eval(3))
+    guardrail = make_guardrail(stream_eval_mode="rolling", debug=True)
     chunks = [_modelresponse_stream_chunk("y" * 200) for _ in range(6)]
 
     yielded = []
@@ -533,38 +614,36 @@ async def test_gated_allow_releases_everything_in_order(guardrail, mock_client):
 
 
 @pytest.mark.asyncio
-async def test_prompt_full_dump_is_untrimmed(
-    guardrail, mock_client, tmp_path, monkeypatch
+async def test_prompt_eval_dump_is_untrimmed(
+    make_guardrail, mock_client, tmp_path, monkeypatch
 ):
-    """*_prompt_full.txt holds the whole message; *_eval_prompt.txt is 10K-trimmed."""
+    """*_eval_prompt.txt holds the whole message (pre-split); no *_prompt_full.txt."""
     import wonderfence_guardrail as wf
 
     monkeypatch.setattr(wf, "MESSAGES_DIR", tmp_path)
     mock_client.evaluate_prompt = AsyncMock(return_value=_allow_result())
+    guardrail = make_guardrail(debug=True)
 
     full = "A" * 5_000 + "B" * 10_000  # 15_000 bytes > BUFFER_MAX_BYTES
     data = {"model": "gpt-4", "messages": [{"role": "user", "content": full}]}
     await guardrail._evaluate_prompt(data, user_api_key_dict=None, hook_name="pre_call")
 
-    full_files = list(tmp_path.glob("*_pre_call_prompt_full.txt"))
+    assert list(tmp_path.glob("*_prompt_full.txt")) == []  # merged into eval_prompt
     eval_files = list(tmp_path.glob("*_pre_call_eval_prompt.txt"))
-    assert len(full_files) == 1 and len(eval_files) == 1
-    assert full_files[0].read_text() == full  # untrimmed
-    sent = eval_files[0].read_text()
-    assert len(sent.encode("utf-8")) == 10_000
-    assert sent == "B" * 10_000  # matches what the SDK received
-    assert mock_client.evaluate_prompt.await_args.kwargs["prompt"] == sent
+    assert len(eval_files) == 1
+    assert eval_files[0].read_text() == full
 
 
 @pytest.mark.asyncio
 async def test_stream_eval_chunks_file_is_indexed(
-    guardrail, mock_client, tmp_path, monkeypatch
+    make_guardrail, mock_client, tmp_path, monkeypatch
 ):
     """One entry per EVAL — the rolling buffer sent to Alice, not per Claude chunk."""
     import wonderfence_guardrail as wf
 
     monkeypatch.setattr(wf, "MESSAGES_DIR", tmp_path)
     mock_client.evaluate_response = AsyncMock(return_value=_allow_result())
+    guardrail = make_guardrail(stream_eval_mode="rolling", debug=True)
 
     # 2 chunks of 200B each trip one eval apiece, then a 50B tail → final eval.
     chunks = [
@@ -581,6 +660,8 @@ async def test_stream_eval_chunks_file_is_indexed(
 
     files = list(tmp_path.glob("*_post_call_stream_eval_chunks.txt"))
     assert len(files) == 1
+    # dump_input=False on the gated sites: no per-eval *_eval_response.txt files.
+    assert list(tmp_path.glob("*_eval_response.txt")) == []
     body = files[0].read_text()
     # One entry per eval call (2 mid-stream + 1 final tail), matching the SDK.
     assert mock_client.evaluate_response.await_count == 3
@@ -739,3 +820,300 @@ async def test_gated_block_log_names_range_and_text(guardrail, mock_client, caps
     line = block_lines[0]
     assert "0..0" in line  # single held chunk, index 0
     assert "NVIDIA" in line  # exact blocked text present
+
+
+# --------------------------- Deltas streaming mode --------------------------
+
+
+async def _run_stream(g, chunks):
+    """Drive the streaming hook to completion, returning the yielded items."""
+    out = []
+    async for ch in g.async_post_call_streaming_iterator_hook(
+        user_api_key_dict=None,
+        response=_agen(chunks),
+        request_data={"model": "gpt-4", "messages": []},
+    ):
+        out.append(ch)
+    return out
+
+
+def _sent_responses(mock_client):
+    return [c.kwargs["response"] for c in mock_client.evaluate_response.await_args_list]
+
+
+@pytest.mark.asyncio
+async def test_deltas_sends_two_windows_not_whole_text(make_guardrail, mock_client):
+    """Each eval carries the previous + current window (~2 increments), never the
+    whole accumulated response."""
+    mock_client.evaluate_response = AsyncMock(return_value=_allow_result())
+    g = make_guardrail(stream_eval_mode="deltas")
+    chunks = [_modelresponse_stream_chunk(c * 200) for c in "ABCDE"]
+
+    yielded = await _run_stream(g, chunks)
+
+    assert yielded == chunks
+    a, b, c, d, e = ("A" * 200, "B" * 200, "C" * 200, "D" * 200, "E" * 200)
+    # First window has no predecessor; every later eval is exactly prev+cur.
+    assert _sent_responses(mock_client) == [a, a + b, b + c, c + d, d + e]
+    # Never the 1000-byte accumulated text.
+    assert all(len(s) <= 400 for s in _sent_responses(mock_client))
+
+
+@pytest.mark.asyncio
+async def test_deltas_block_withholds_offending_batch(make_guardrail, mock_client):
+    """Deltas mode: the batch that trips BLOCK is never yielded; earlier ones are."""
+    mock_client.evaluate_response = AsyncMock(side_effect=_block_on_nth_eval(3))
+    g = make_guardrail(stream_eval_mode="deltas")
+    chunks = [_modelresponse_stream_chunk("y" * 200) for _ in range(6)]
+
+    yielded = await _run_stream(g, chunks)
+
+    assert len(yielded) == 3  # chunks 0,1 released + 1 block frame
+    assert chunks[2] not in yielded
+    assert yielded[-1].choices[0].finish_reason == "content_filter"
+
+
+@pytest.mark.asyncio
+async def test_deltas_final_tail_evaluates_prev_plus_cur(make_guardrail, mock_client):
+    """Stream ends mid-window → the existing final-tail branch evals prev+cur."""
+    mock_client.evaluate_response = AsyncMock(return_value=_allow_result())
+    g = make_guardrail(stream_eval_mode="deltas")
+    chunks = [
+        _modelresponse_stream_chunk("A" * 200),
+        _modelresponse_stream_chunk("B" * 50),
+    ]
+
+    yielded = await _run_stream(g, chunks)
+
+    assert yielded == chunks
+    assert _sent_responses(mock_client) == ["A" * 200, "A" * 200 + "B" * 50]
+
+
+@pytest.mark.asyncio
+async def test_deltas_boundary_end_releases_textless_trailer(
+    make_guardrail, mock_client
+):
+    """Stream ends on a window boundary with textless trailer chunks → no extra
+    eval, trailers still released."""
+    mock_client.evaluate_response = AsyncMock(return_value=_allow_result())
+    g = make_guardrail(stream_eval_mode="deltas")
+    chunks = [
+        _modelresponse_stream_chunk("A" * 200),
+        _modelresponse_stream_chunk(""),  # e.g. a trailing stop event
+    ]
+
+    yielded = await _run_stream(g, chunks)
+
+    assert yielded == chunks
+    assert _sent_responses(mock_client) == ["A" * 200]  # no final-tail eval
+
+
+# --------------------------- Stream eval mode config ------------------------
+
+
+@pytest.mark.asyncio
+async def test_env_mode_selects_eval_path(make_guardrail, mock_client, monkeypatch):
+    """Each of the three env values drives a different eval payload for the same
+    stream: rolling accumulates, deltas pairs two windows, accumulate_all evals
+    the whole response once."""
+    a, b, c = "A" * 200, "B" * 200, "C" * 200
+
+    async def _run(mode):
+        monkeypatch.setenv("WONDERFENCE_STREAM_EVAL_MODE", mode)
+        mock_client.evaluate_response = AsyncMock(return_value=_allow_result())
+        g = make_guardrail()
+        await _run_stream(g, [_modelresponse_stream_chunk(t) for t in (a, b, c)])
+        return _sent_responses(mock_client)
+
+    assert await _run("rolling") == [a, a + b, a + b + c]
+    assert await _run("deltas") == [a, a + b, b + c]
+    assert await _run("accumulate_all") == [a + b + c]
+
+
+def test_stream_eval_mode_default_is_deltas(make_guardrail, monkeypatch):
+    from wonderfence_guardrail import StreamEvalMode
+
+    monkeypatch.delenv("WONDERFENCE_STREAM_EVAL_MODE", raising=False)
+    assert make_guardrail().stream_eval_mode is StreamEvalMode.DELTAS
+
+
+def test_stream_eval_mode_unknown_value_raises_at_init(make_guardrail, monkeypatch):
+    with pytest.raises(ValueError):
+        make_guardrail(stream_eval_mode="bogus")
+
+    monkeypatch.setenv("WONDERFENCE_STREAM_EVAL_MODE", "bogus")
+    with pytest.raises(ValueError):
+        make_guardrail()
+
+
+# --------------------------- Request dumps ----------------------------------
+
+
+def test_dumps_are_gated_on_the_debug_flag(make_guardrail, tmp_path, monkeypatch):
+    """Every dump writer no-ops with debug=False and writes with debug=True."""
+    import wonderfence_guardrail as wf
+
+    monkeypatch.setattr(wf, "MESSAGES_DIR", tmp_path)
+
+    def _write_all():
+        wf._dump_request("pre_call_request", {"messages": []})
+        wf._dump_eval_text("prompt text", "pre_call_eval_prompt")
+        wf._append_eval_buffer(tmp_path / "eval_chunks.txt", 1, "buffered")
+        wf._log_chunk(
+            0,
+            _modelresponse_stream_chunk("chunk text"),
+            tmp_path / "chunks_text.jsonl",
+            tmp_path / "chunks_raw.jsonl",
+            tmp_path / "response_full.txt",
+        )
+
+    make_guardrail(debug=False)
+    _write_all()
+    assert list(tmp_path.iterdir()) == []  # nothing written
+
+    make_guardrail(debug=True)
+    _write_all()
+    written = {p.name for p in tmp_path.iterdir()}
+    assert "eval_chunks.txt" in written
+    assert {"chunks_text.jsonl", "chunks_raw.jsonl", "response_full.txt"} <= written
+    assert any(n.endswith("_pre_call_request.json") for n in written)
+    assert any(n.endswith("_pre_call_eval_prompt.txt") for n in written)
+
+
+def test_debug_flag_decouples_from_litellm_log(make_guardrail):
+    """`debug` is the only switch: it emits our DEBUG lines via our own handler
+    instead of litellm's, which sits on the parent at LITELLM_LOG's level."""
+    import logging
+
+    from wonderfence_guardrail import logger
+
+    make_guardrail(debug=True)
+    assert logger.isEnabledFor(logging.DEBUG)
+    assert logger.handlers  # own handler — LITELLM_LOG=INFO can't drop the records
+    assert logger.propagate is False
+
+    make_guardrail(debug=False)
+    # Pinned to INFO, so LITELLM_LOG=DEBUG on the parent can't turn us back on.
+    assert not logger.isEnabledFor(logging.DEBUG)
+
+
+# --------------------------- AnalysisContext --------------------------------
+
+
+@pytest.mark.parametrize(
+    "metadata,expected",
+    [
+        ({"user_api_key_user_id": "key-owner"}, "key-owner"),  # last-resort fallback
+        (
+            {"user_api_key_end_user_id": "end-user", "user_api_key_user_id": "owner"},
+            "end-user",  # end-user still wins over the key owner
+        ),
+        ({}, None),
+    ],
+)
+def test_context_user_id_falls_back_to_key_owner(
+    guardrail, monkeypatch, metadata, expected
+):
+    from unittest.mock import Mock
+
+    import wonderfence_guardrail as wf
+
+    monkeypatch.setattr(wf, "AnalysisContext", Mock())
+    guardrail._build_analysis_context({"model": "gpt-4", "metadata": metadata})
+    assert wf.AnalysisContext.call_args.kwargs["user_id"] == expected
+
+
+# --------------------------- session id from headers ------------------------
+
+
+@pytest.mark.parametrize(
+    "data,expected",
+    [
+        ({"litellm_session_id": "explicit"}, "explicit"),  # body wins
+        (
+            {
+                "litellm_metadata": {
+                    "headers": {"X-Claude-Code-Session-Id": "cc-sess-1"}
+                }
+            },
+            "cc-sess-1",  # Claude Code's per-session header, case-insensitive
+        ),
+        (
+            {
+                "proxy_server_request": {
+                    "headers": {"x-claude-code-session-id": "psr-1"}
+                }
+            },
+            "psr-1",  # fallback location
+        ),
+        (
+            {
+                "litellm_metadata": {
+                    "headers": {
+                        "x-claude-code-session-id": "vendor",
+                        "x-litellm-session-id": "litellm",
+                    }
+                }
+            },
+            "litellm",  # explicit litellm header outranks the generic one
+        ),
+        ({"litellm_metadata": {"headers": {"user-agent": "curl"}}}, None),
+        ({}, None),
+    ],
+)
+def test_extract_session_id_from_headers(data, expected):
+    from wonderfence_guardrail import _extract_session_id
+
+    assert _extract_session_id(data) == expected
+
+
+def test_context_session_id_uses_header(guardrail, monkeypatch):
+    """The SDK context picks up the header-derived session id too."""
+    from unittest.mock import Mock
+
+    import wonderfence_guardrail as wf
+
+    monkeypatch.setattr(wf, "AnalysisContext", Mock())
+    guardrail._build_analysis_context(
+        {
+            "model": "gpt-4",
+            "litellm_metadata": {"headers": {"x-claude-code-session-id": "sess-42"}},
+        }
+    )
+    assert wf.AnalysisContext.call_args.kwargs["session_id"] == "sess-42"
+
+
+# --------------------------- user id normalization --------------------------
+
+_CC_BLOB = json.dumps(
+    {"device_id": "d" * 64, "account_uuid": "", "session_id": "sess-1"}
+)
+_CC_BLOB_SIGNED_IN = json.dumps(
+    {"device_id": "d" * 64, "account_uuid": "acct-9", "session_id": "sess-1"}
+)
+
+
+@pytest.mark.parametrize(
+    "metadata,expected",
+    [
+        ({"user_id": _CC_BLOB}, "d" * 64),  # not signed in → device_id
+        ({"user_id": _CC_BLOB_SIGNED_IN}, "acct-9"),  # signed in → account_uuid
+        ({"user_id": "plain-id"}, "plain-id"),  # plain strings pass through
+        ({"user_id": "{not json"}, "{not json"),  # unparseable → as-is
+        # Blob with no usable identity → fall through to the next candidate.
+        (
+            {"user_id": json.dumps({"session_id": "s"}), "user_api_key_user_id": "own"},
+            "own",
+        ),
+        ({"user_id": _CC_BLOB, "user_api_key_end_user_id": "end"}, "end"),  # order kept
+        ({"user_id": {"device_id": "x"}}, None),  # non-string → unusable
+    ],
+)
+def test_user_id_normalization(guardrail, monkeypatch, metadata, expected):
+    from unittest.mock import Mock
+
+    import wonderfence_guardrail as wf
+
+    monkeypatch.setattr(wf, "AnalysisContext", Mock())
+    guardrail._build_analysis_context({"model": "gpt-4", "metadata": metadata})
+    assert wf.AnalysisContext.call_args.kwargs["user_id"] == expected

@@ -11,8 +11,10 @@ import itertools
 import json
 import logging
 import os
+import re
 import time
 from collections import OrderedDict
+from enum import Enum
 from pathlib import Path
 from typing import Any, AsyncGenerator
 
@@ -44,6 +46,9 @@ RESPONSE_SECTION_MAX_CONCURRENCY = int(
     os.environ.get("WONDERFENCE_RESPONSE_SECTION_CONCURRENCY", "10")
 )
 
+# `x-claude-code-session-id`, `x-litellm-session-id`, `x-<vendor>-session-id`.
+_SESSION_ID_HEADER_RE = re.compile(r"^x-.+-session-id$")
+
 # Monotonic per-process counter so dump filenames sort by write order even when
 # timestamps collide at ms resolution (concurrent requests interleave).
 _dump_seq = itertools.count(1)
@@ -55,12 +60,53 @@ def _seq_ts() -> str:
     return f"{ts}_{next(_dump_seq):06d}"
 
 
-def _tail_bytes_utf8(text: str, max_bytes: int) -> str:
-    """Suffix of `text` whose UTF-8 encoding fits in `max_bytes`, no split codepoint."""
-    encoded = text.encode("utf-8")
-    if len(encoded) <= max_bytes:
-        return text
-    return encoded[-max_bytes:].decode("utf-8", errors="ignore")
+def _configure_logging(debug: bool) -> None:
+    """Make the guardrail's `debug` flag the single switch for its debug output.
+
+    litellm's handler sits on the parent (verbose_proxy_logger) at LITELLM_LOG's
+    level, so raising only our logger's level emits records the parent handler
+    then drops — DEBUG lines never appear (while bare print()s do, which is the
+    confusing part). Our own handler + propagate=False decouples us from
+    LITELLM_LOG in both directions: `debug: true` shows our DEBUG lines even at
+    LITELLM_LOG=INFO, `debug: false` hides them even at LITELLM_LOG=DEBUG.
+    """
+    logger.setLevel(logging.DEBUG if debug else logging.INFO)
+    if not debug:
+        return
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s - %(name)s:%(levelname)s: "
+                "%(filename)s:%(lineno)d - %(message)s"
+            )
+        )
+        logger.addHandler(handler)
+    logger.propagate = False
+
+
+def _dumps_enabled() -> bool:
+    """Per-request dumps are debug-only — they mirror full request/response
+    bodies to disk, useful for replay and dead weight (plus a data-retention
+    liability) otherwise. Driven by the same `debug` flag via _configure_logging.
+    """
+    return logger.isEnabledFor(logging.DEBUG)
+
+
+class StreamEvalMode(str, Enum):
+    """How a streamed response is evaluated (WONDERFENCE_STREAM_EVAL_MODE).
+
+    DELTAS (default): gated on the current + previous EVAL_BYTES_INCREMENT
+    window only (~2 increments per call) — cheap payload, but a violation that
+    only reads as one across a longer span is missed.
+    ROLLING: gated on a rolling BUFFER_MAX_BYTES window, re-sent every
+    EVAL_BYTES_INCREMENT bytes — widest detection context, ~10KB per call.
+    ACCUMULATE_ALL: buffer the whole response, evaluate once, then re-stream.
+    """
+
+    ROLLING = "rolling"
+    DELTAS = "deltas"
+    ACCUMULATE_ALL = "accumulate_all"
 
 
 def _split_overlapping_utf8(text: str, max_bytes: int, overlap_bytes: int) -> list[str]:
@@ -125,6 +171,41 @@ class _RollingBuffer:
         return self._buf.decode("utf-8", errors="ignore")
 
 
+class _DeltaWindows:
+    """Two-window buffer for streaming eval: the eval text is the previous
+    window plus the current one (~2 × `eval_increment`) instead of the whole
+    rolling window, so each call carries ~400 bytes instead of ~10K.
+
+    Exposes the same 5 methods as `_RollingBuffer`, so the gated loop is
+    identical for both. Every adjacent window pair is evaluated exactly once,
+    so a detection straddling a window boundary is still covered — but a
+    violation that only reads as one across a longer span is not.
+
+    Windows close only on chunk boundaries and whole chunk text is appended, so
+    neither window ever holds a split codepoint.
+    """
+
+    def __init__(self, eval_increment: int) -> None:
+        self.eval_increment = eval_increment
+        self._prev: bytes = b""
+        self._cur: bytes = b""
+
+    def append_text(self, text: str) -> None:
+        self._cur += text.encode("utf-8")
+
+    def needs_eval(self) -> bool:
+        return len(self._cur) >= self.eval_increment
+
+    def mark_evaluated(self) -> None:
+        self._prev, self._cur = self._cur, b""
+
+    def pending_bytes(self) -> int:
+        return len(self._cur)
+
+    def text(self) -> str:
+        return (self._prev + self._cur).decode("utf-8", errors="ignore")
+
+
 def _safe_serialize(obj: Any, seen: set[int] | None = None) -> Any:
     """Walk obj, breaking cycles and converting unknowns via str()."""
     if seen is None:
@@ -152,8 +233,51 @@ def _safe_serialize(obj: Any, seen: set[int] | None = None) -> Any:
         seen.discard(oid)
 
 
+def _session_id_from_headers(headers: Any) -> str | None:
+    """Session id from an `x-<vendor>-session-id` request header.
+
+    Claude Code sends `x-claude-code-session-id: <uuid>`. Newer LiteLLM maps
+    such headers onto `litellm_session_id` itself, but the pinned runtime
+    (1.81.0) has no such mapping, so read the header directly.
+    """
+    if not isinstance(headers, dict):
+        return None
+    normalized = {k.lower(): v for k, v in headers.items() if isinstance(k, str)}
+    explicit = normalized.get("x-litellm-session-id")
+    if explicit:
+        return str(explicit)
+    for key, value in normalized.items():
+        if _SESSION_ID_HEADER_RE.match(key) and isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _normalize_user_id(value: Any) -> str | None:
+    """Reduce a user-id candidate to a usable identity string.
+
+    Claude Code sets Anthropic's `metadata.user_id` to a 150-char JSON blob
+    (`{"device_id": ..., "account_uuid": ..., "session_id": ...}`), which the
+    100-char cap would truncate into invalid JSON. Pull the real identity out:
+    `account_uuid` when signed in, else the stable per-machine `device_id`.
+    Plain strings pass through; anything unusable yields None so the caller
+    falls through to the next candidate.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    if not value.startswith("{"):
+        return value
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, ValueError):
+        return value
+    if not isinstance(parsed, dict):
+        return value
+    picked = parsed.get("account_uuid") or parsed.get("device_id")
+    return str(picked) if picked else None
+
+
 def _extract_session_id(data: Any) -> str | None:
-    """Try to extract session_id from request data."""
+    """Try to extract session_id from request data, then from request headers."""
     if not isinstance(data, dict):
         return None
     sid = data.get("litellm_session_id") or data.get("session_id")
@@ -164,11 +288,18 @@ def _extract_session_id(data: Any) -> str | None:
         sid = metadata.get("litellm_session_id") or metadata.get("session_id")
         if sid:
             return str(sid)
+    for source in (metadata, data.get("proxy_server_request")):
+        if isinstance(source, dict):
+            sid = _session_id_from_headers(source.get("headers"))
+            if sid:
+                return sid
     return None
 
 
 def _dump_request(hook_name: str, data: Any) -> None:
     """Save full request data to messages/<ts>_<seq>[_<session_id>]_<hook_name>.json."""
+    if not _dumps_enabled():
+        return
     try:
         MESSAGES_DIR.mkdir(exist_ok=True)
         ts = _seq_ts()
@@ -185,6 +316,8 @@ def _dump_request(hook_name: str, data: Any) -> None:
 
 def _dump_response_text(response: Any, tag: str = "response_text") -> None:
     """Save plain-text LLM response content to messages/<ts>_<seq>_<tag>.txt."""
+    if not _dumps_enabled():
+        return
     try:
         text = ""
         if hasattr(response, "choices") and response.choices:
@@ -205,9 +338,11 @@ def _dump_eval_text(text: str, tag: str, sid: str | None = None) -> None:
     """Save the EXACT text sent to WonderFence to messages/<ts>_<seq>[_<sid>]_<tag>.txt.
 
     `tag` is `<event>_eval_prompt` or `<event>_eval_response`. Unlike the
-    request/response dumps, this is post-flattening and post-trimming — byte-for-byte
-    what evaluate_prompt/evaluate_response receives.
+    request/response dumps, this is post-flattening — the exact text handed to
+    the eval layer, before it is split into sections.
     """
+    if not _dumps_enabled():
+        return
     try:
         if not text:
             return
@@ -222,11 +357,14 @@ def _dump_eval_text(text: str, tag: str, sid: str | None = None) -> None:
 def _append_eval_buffer(
     path: Path, index: int, buffer_text: str, final: bool = False
 ) -> None:
-    """Append one entry per eval call: the rolling buffer sent to WonderFence.
+    """Append one entry per eval call: the buffer sent to WonderFence.
 
     One `eval-NN` block per evaluate_response call, not per Claude chunk — the
-    buffer is the ~10K rolling window, so each entry is written on its own lines.
+    buffer is the ~10K rolling window (rolling mode) or the current + previous
+    increment window (deltas mode), so each entry is written on its own lines.
     """
+    if not _dumps_enabled():
+        return
     try:
         tag = f"eval-{index:02d}{' (final tail)' if final else ''}"
         with path.open("a") as f:
@@ -246,8 +384,11 @@ def _make_chunk_log_paths(sid: str | None) -> tuple[Path, Path, Path, Path]:
     Each file takes its own sequence number, assigned in the order the files are
     listed here: raw wire events first, then extracted per-chunk text, then the
     assembled response, then the eval inputs.
+
+    Paths are still returned when dumps are off — the writers themselves no-op.
     """
-    MESSAGES_DIR.mkdir(exist_ok=True)
+    if _dumps_enabled():
+        MESSAGES_DIR.mkdir(exist_ok=True)
     sid_part = f"_{sid}" if sid else ""
     raw = MESSAGES_DIR / f"{_seq_ts()}{sid_part}_post_call_stream_chunks_raw.jsonl"
     text = MESSAGES_DIR / f"{_seq_ts()}{sid_part}_post_call_stream_chunks_text.jsonl"
@@ -283,6 +424,8 @@ def _log_chunk(
 ) -> None:
     """Append one line to each per-request log + append running text + print to stdout.
     Best effort."""
+    if not _dumps_enabled():
+        return
     try:
         text = WonderFenceGuardrail._extract_chunk_text(chunk)
         raw = _serialize_chunk_raw(chunk)
@@ -335,11 +478,16 @@ class WonderFenceGuardrail(CustomGuardrail):
         platform: Cloud platform identifier (e.g., 'aws', 'azure', 'databricks')
         fail_open: When True, allow requests to proceed if WonderFence is unreachable.
             When False (default), block requests when WonderFence is unavailable.
-        debug: When True, set guardrail logger to DEBUG level. Defaults to False.
+        debug: The single debug switch, independent of LITELLM_LOG. When True,
+            the guardrail's DEBUG log lines are printed AND every per-request
+            dump under MESSAGES_DIR is written. When False (default), neither.
         max_cached_clients: Max SDK clients cached per guardrail instance, keyed by
             API key (defaults to WONDERFENCE_MAX_CACHED_CLIENTS env var, then 10).
         connection_pool_limit: Max connections in each SDK client's HTTP pool
             (defaults to WONDERFENCE_CONNECTION_POOL_LIMIT env var, then SDK default).
+        stream_eval_mode: How a streamed response is evaluated — see
+            StreamEvalMode (defaults to WONDERFENCE_STREAM_EVAL_MODE env var,
+            then "deltas"). An unknown value raises ValueError.
         **kwargs: Additional arguments passed to CustomGuardrail
     """
 
@@ -354,7 +502,7 @@ class WonderFenceGuardrail(CustomGuardrail):
         debug: bool = False,
         max_cached_clients: int | None = None,
         connection_pool_limit: int | None = None,
-        eval_mode_accumulate_all: bool | None = None,
+        stream_eval_mode: str | None = None,
         **kwargs: Any,
     ) -> None:
         self.api_key = api_key or os.environ.get("WONDERFENCE_API_KEY")
@@ -365,29 +513,18 @@ class WonderFenceGuardrail(CustomGuardrail):
         self.platform = platform
         self.fail_open = fail_open
 
-        def _env_bool(name: str) -> bool:
-            return os.environ.get(name, "").strip().lower() in (
-                "1",
-                "true",
-                "yes",
-                "on",
-            )
-
-        # Streaming response mode. False (default): gated rolling-buffer mode —
-        # the response is evaluated on a rolling 10K buffer every ~200 chars and
-        # chunks are held until the eval covering them returns ALLOW, so a BLOCK
-        # is caught before the offending bytes reach the user (MASK/text
-        # replacements still can't be applied). True: accumulate the entire
-        # response, evaluate it once, then re-stream — slower (no live tokens)
-        # but BLOCK and MASK/replacements are fully enforceable.
-        self.eval_mode_accumulate_all = (
-            eval_mode_accumulate_all
-            if eval_mode_accumulate_all is not None
-            else _env_bool("WONDERFENCE_EVAL_MODE_ACCUMULATE_ALL")
+        # Streaming response mode — see StreamEvalMode. Both gated modes hold
+        # chunks until the eval covering them returns ALLOW, so a BLOCK is
+        # caught before the offending bytes reach the user (MASK still can't be
+        # applied); they differ only in how much context each call carries.
+        # An unknown value raises ValueError here, at init.
+        self.stream_eval_mode = StreamEvalMode(
+            stream_eval_mode
+            or os.environ.get("WONDERFENCE_STREAM_EVAL_MODE")
+            or StreamEvalMode.DELTAS.value
         )
 
-        if debug:
-            logger.setLevel(logging.DEBUG)
+        _configure_logging(debug)
         self._client_cache: OrderedDict[str, WonderFenceV2Client] = OrderedDict()
         self._client_cache_maxsize = max_cached_clients or int(
             os.environ.get("WONDERFENCE_MAX_CACHED_CLIENTS", "10")
@@ -530,21 +667,26 @@ class WonderFenceGuardrail(CustomGuardrail):
                 if "/" in model_str:
                     provider, model_name = model_str.split("/", 1)
 
-        # User ID from API key metadata (prefixed by framework)
-        user_id = (
-            metadata.get("user_api_key_end_user_id")
-            or metadata.get("end_user_id")
-            or metadata.get("user_id")
-        )
+        # User ID from API key metadata (prefixed by framework). End-user IDs
+        # win; `user_api_key_user_id` (the owner of the virtual key, set via
+        # /key/generate --user_id) is the last resort — coarser than an end
+        # user, but the only identity available when the caller doesn't pass one.
+        user_id = None
+        for candidate in (
+            metadata.get("user_api_key_end_user_id"),
+            metadata.get("end_user_id"),
+            metadata.get("user_id"),
+            metadata.get("user_api_key_user_id"),
+        ):
+            user_id = _normalize_user_id(candidate)
+            if user_id:
+                break
         if user_id and len(user_id) > 100:
             user_id = user_id[:100]
 
-        # Session ID: Users pass `litellm_session_id` in request extra_body
-        session_id = (
-            request_data.get("litellm_session_id")
-            or metadata.get("litellm_session_id")
-            or metadata.get("session_id")
-        )
+        # Session ID: `litellm_session_id` in extra_body, else an
+        # `x-<vendor>-session-id` header (Claude Code sends one per session).
+        session_id = _extract_session_id(request_data)
 
         return AnalysisContext(
             session_id=session_id,
@@ -791,56 +933,20 @@ class WonderFenceGuardrail(CustomGuardrail):
             SafetyCheckUnavailable: If evaluation fails
         """
         try:
-            sid = _extract_session_id(data)
             full_text = self._collect_user_text_full(data)
-            prompt_buffer = _tail_bytes_utf8(full_text, BUFFER_MAX_BYTES)
-            # Full flattened message before the 10K tail-trim — diff against
-            # *_eval_prompt.txt to see exactly what the trim dropped.
-            _dump_eval_text(full_text, f"{hook_name}_prompt_full", sid)
-            if prompt_buffer != full_text:
-                logger.debug(
-                    "WonderFence %s: prompt trimmed for eval, %d → %d bytes "
-                    "(full text dumped to *_%s_prompt_full.txt)",
-                    hook_name,
-                    len(full_text.encode("utf-8")),
-                    len(prompt_buffer.encode("utf-8")),
-                    hook_name,
-                )
-            _dump_eval_text(prompt_buffer, f"{hook_name}_eval_prompt", sid)
-            if not prompt_buffer:
+            if not full_text:
                 logger.debug(
                     "WonderFence %s: no user message found, skipping", hook_name
                 )
                 return data
 
-            api_key = self._resolve_api_key(data, user_api_key_dict)
-            app_id = self._resolve_app_id(data, user_api_key_dict)
-            client = await self._get_client(api_key)
-            context = self._build_analysis_context(data)
-
-            print(
-                f"[wonderfence] {hook_name} → evaluate_prompt: {len(prompt_buffer)} chars "
-                f"({len(prompt_buffer.encode('utf-8'))} bytes) sent to Alice",
-                flush=True,
-            )
-            logger.debug(
-                "WonderFence %s sending to evaluate_prompt (app_id=%s, context=%s, len=%d): %s",
-                hook_name,
-                app_id,
-                context,
-                len(prompt_buffer),
-                prompt_buffer,
+            # No tail-trim: the whole message is evaluated, split into
+            # BUFFER_MAX_BYTES sections by the common layer when oversized.
+            modified_content = await self._evaluate_text(
+                full_text, data, user_api_key_dict, hook_name, kind="prompt"
             )
 
-            result = await client.evaluate_prompt(
-                app_id=app_id, prompt=prompt_buffer, context=context, custom_fields=None
-            )
-
-            modified_content = self._handle_evaluation_result(
-                result, "prompt", prompt_buffer
-            )
-
-            if modified_content != prompt_buffer:
+            if modified_content != full_text:
                 for message in reversed(data.get("messages", [])):
                     if message.get("role") != "user":
                         continue
@@ -994,8 +1100,8 @@ class WonderFenceGuardrail(CustomGuardrail):
                 )
                 return response
 
-            modified_content = await self._evaluate_response_text(
-                response_content, data, user_api_key_dict, "post_call"
+            modified_content = await self._evaluate_text(
+                response_content, data, user_api_key_dict, "post_call", kind="response"
             )
 
             if modified_content != response_content:
@@ -1009,41 +1115,41 @@ class WonderFenceGuardrail(CustomGuardrail):
             self._handle_error(e, "post_call")
             return response
 
-    async def _evaluate_response_text(
+    async def _evaluate_text(
         self,
-        response_content: str,
+        text: str,
         data: dict[str, Any],
         user_api_key_dict: UserAPIKeyAuth,
         hook_name: str,
+        kind: str,
         chunk_count: int | None = None,
+        dump_input: bool = True,
     ) -> str:
-        """Send response text to WonderFence and return possibly-modified content.
+        """Send text to WonderFence and return possibly-modified content.
 
-        Responses larger than BUFFER_MAX_BYTES are split into overlapping
-        sections (overlap = RESPONSE_SECTION_OVERLAP_BYTES) and evaluated
-        concurrently (bounded by RESPONSE_SECTION_MAX_CONCURRENCY), so
-        detections past the first 10K aren't missed. A BLOCK on any section
-        raises (blocks the whole response). MASK across multiple sections is
-        reassembled best-effort.
+        Common layer for both directions: `kind` is "prompt" or "response" and
+        selects the SDK call. Text larger than BUFFER_MAX_BYTES is split into
+        overlapping sections (overlap = RESPONSE_SECTION_OVERLAP_BYTES) and
+        evaluated concurrently (bounded by RESPONSE_SECTION_MAX_CONCURRENCY),
+        so detections past the first 10K aren't missed. A BLOCK on any section
+        raises (blocks the whole request/response). MASK across multiple
+        sections is reassembled best-effort.
+
+        `dump_input=False` suppresses the eval-text dump for the gated stream
+        evals, which fire every ~200 bytes — dumping each would mean dozens of
+        files per request, and their input is already accumulated in
+        *_post_call_stream_eval_chunks.txt.
         """
         api_key = self._resolve_api_key(data, user_api_key_dict)
         app_id = self._resolve_app_id(data, user_api_key_dict)
         client = await self._get_client(api_key)
         context = self._build_analysis_context(data)
 
-        # One-shot evals get their exact input dumped. The rolling/gated stream
-        # evals fire every ~200 bytes — dumping each would mean dozens of files
-        # per request, and their input is already accumulated in the running
-        # post_call_stream_eval_response.txt.
-        if "rolling" not in hook_name and "gated" not in hook_name:
-            _dump_eval_text(
-                response_content,
-                f"{hook_name}_eval_response",
-                _extract_session_id(data),
-            )
+        if dump_input:
+            _dump_eval_text(text, f"{hook_name}_eval_{kind}", _extract_session_id(data))
 
         sections = _split_overlapping_utf8(
-            response_content, BUFFER_MAX_BYTES, RESPONSE_SECTION_OVERLAP_BYTES
+            text, BUFFER_MAX_BYTES, RESPONSE_SECTION_OVERLAP_BYTES
         )
         sent_chars = sum(len(s) for s in sections)
         sent_bytes = sum(len(s.encode("utf-8")) for s in sections)
@@ -1051,44 +1157,51 @@ class WonderFenceGuardrail(CustomGuardrail):
             f" from {chunk_count} stream chunks" if chunk_count is not None else ""
         )
         print(
-            f"[wonderfence] {hook_name} → evaluate_response: {sent_chars} chars "
+            f"[wonderfence] {hook_name} → evaluate_{kind}: {sent_chars} chars "
             f"({sent_bytes} bytes) sent to Alice in {len(sections)} Alice call(s){chunk_note} "
-            f"[content={len(response_content)} chars]",
+            f"[content={len(text)} chars]",
             flush=True,
         )
         logger.debug(
-            "WonderFence %s sending to evaluate_response "
+            "WonderFence %s sending to evaluate_%s "
             "(app_id=%s, context=%s, len=%d, sections=%d)",
             hook_name,
+            kind,
             app_id,
             context,
-            len(response_content),
+            len(text),
             len(sections),
         )
 
-        if len(sections) == 1:
-            result = await client.evaluate_response(
-                app_id=app_id, response=sections[0], context=context, custom_fields=None
+        async def _evaluate_section(section: str) -> EvaluateMessageResponse:
+            if kind == "prompt":
+                return await client.evaluate_prompt(
+                    app_id=app_id, prompt=section, context=context, custom_fields=None
+                )
+            return await client.evaluate_response(
+                app_id=app_id, response=section, context=context, custom_fields=None
             )
-            return self._handle_evaluation_result(result, "response", sections[0])
+
+        if len(sections) == 1:
+            result = await _evaluate_section(sections[0])
+            return self._handle_evaluation_result(result, kind, sections[0])
 
         sem = asyncio.Semaphore(RESPONSE_SECTION_MAX_CONCURRENCY)
 
         async def _eval_section(i: int, section: str) -> str:
             async with sem:
                 logger.debug(
-                    "WonderFence %s evaluate_response section %d/%d (len=%d)",
+                    "WonderFence %s evaluate_%s section %d/%d (len=%d)",
                     hook_name,
+                    kind,
                     i + 1,
                     len(sections),
                     len(section),
                 )
-                result = await client.evaluate_response(
-                    app_id=app_id, response=section, context=context, custom_fields=None
-                )
+                result = await _evaluate_section(section)
                 # Raises HTTPException on BLOCK — gather propagates it, blocking
-                # the whole response.
-                return self._handle_evaluation_result(result, "response", section)
+                # the whole request/response.
+                return self._handle_evaluation_result(result, kind, section)
 
         # gather preserves order, so handled_parts aligns with sections.
         handled_parts = await asyncio.gather(
@@ -1096,7 +1209,7 @@ class WonderFenceGuardrail(CustomGuardrail):
         )
 
         if all(h == s for h, s in zip(handled_parts, sections)):
-            return response_content
+            return text
 
         logger.warning(
             "WonderFence %s: MASK across %d sections — reassembling best-effort "
@@ -1297,11 +1410,15 @@ class WonderFenceGuardrail(CustomGuardrail):
     ) -> AsyncGenerator[Any, None]:
         """Evaluate the streamed response, withholding chunks until they clear.
 
-        Default (eval_mode_accumulate_all=false): gated rolling-buffer mode —
-        hold chunks, eval a rolling 10K window every ~200 bytes, release the
-        held batch on ALLOW, discard it and inject a BLOCK frame otherwise.
+        Both gated modes hold chunks, eval every ~200 bytes, release the held
+        batch on ALLOW, and discard it + inject a BLOCK frame otherwise. They
+        differ only in what each eval carries:
+        - stream_eval_mode=deltas (default): the current + previous ~200-byte
+          window only — ~400 bytes per call, narrower detection context.
+        - stream_eval_mode=rolling: a rolling 10K window — widest detection
+          context, ~10K per call.
 
-        eval_mode_accumulate_all=true: buffer everything, eval once, re-yield.
+        stream_eval_mode=accumulate_all: buffer everything, eval once, re-yield.
         - ModelResponseStream chunks (/v1/chat/completions): assemble via
           stream_chunk_builder, re-stream via MockResponseIterator (BLOCK + MASK).
         - Raw SSE bytes (/v1/messages Anthropic): parse SSE, re-yield original
@@ -1316,14 +1433,19 @@ class WonderFenceGuardrail(CustomGuardrail):
         )
         eval_idx = 0
 
-        if not self.eval_mode_accumulate_all:
+        if self.stream_eval_mode is not StreamEvalMode.ACCUMULATE_ALL:
             logger.debug(
-                "WonderFence post_call_stream: gated rolling-buffer mode "
+                "WonderFence post_call_stream: gated mode=%s "
                 "(max_bytes=%d, increment=%d)",
+                self.stream_eval_mode.value,
                 BUFFER_MAX_BYTES,
                 EVAL_BYTES_INCREMENT,
             )
-            rb = _RollingBuffer(BUFFER_MAX_BYTES, EVAL_BYTES_INCREMENT)
+            rb: _RollingBuffer | _DeltaWindows = (
+                _DeltaWindows(EVAL_BYTES_INCREMENT)
+                if self.stream_eval_mode is StreamEvalMode.DELTAS
+                else _RollingBuffer(BUFFER_MAX_BYTES, EVAL_BYTES_INCREMENT)
+            )
             pending: list[Any] = []  # buffered, not yet released, in order
             released_any = False
             chunk_count = 0
@@ -1346,12 +1468,14 @@ class WonderFenceGuardrail(CustomGuardrail):
                     eval_idx += 1
                     _append_eval_buffer(eval_buffers_path, eval_idx, rb.text())
                     try:
-                        modified = await self._evaluate_response_text(
+                        modified = await self._evaluate_text(
                             rb.text(),
                             request_data,
                             user_api_key_dict,
                             "post_call_stream_gated",
+                            kind="response",
                             chunk_count=chunk_count,
+                            dump_input=False,
                         )
                         if modified != rb.text():
                             logger.warning(
@@ -1413,12 +1537,14 @@ class WonderFenceGuardrail(CustomGuardrail):
                 eval_idx += 1
                 _append_eval_buffer(eval_buffers_path, eval_idx, rb.text(), final=True)
                 try:
-                    await self._evaluate_response_text(
+                    await self._evaluate_text(
                         rb.text(),
                         request_data,
                         user_api_key_dict,
                         "post_call_stream_gated_final",
+                        kind="response",
                         chunk_count=chunk_count,
+                        dump_input=False,
                     )
                     for c in pending:
                         self._track_open_block(c, blockstate)
@@ -1511,11 +1637,12 @@ class WonderFenceGuardrail(CustomGuardrail):
                 if not response_content:
                     logger.debug("WonderFence post_call_stream: no SSE text, skipping")
                 else:
-                    modified = await self._evaluate_response_text(
+                    modified = await self._evaluate_text(
                         response_content,
                         request_data,
                         user_api_key_dict,
                         "post_call_stream",
+                        kind="response",
                     )
                     if modified != response_content:
                         logger.warning(
@@ -1565,8 +1692,12 @@ class WonderFenceGuardrail(CustomGuardrail):
                     yield chunk
                 return
 
-            modified_content = await self._evaluate_response_text(
-                response_content, request_data, user_api_key_dict, "post_call_stream"
+            modified_content = await self._evaluate_text(
+                response_content,
+                request_data,
+                user_api_key_dict,
+                "post_call_stream",
+                kind="response",
             )
 
             final_content = modified_content

@@ -86,25 +86,35 @@ switch persistently, edit `~/.alice-litellm/.env` (or just re-run
 
 The unit of text sent for evaluation is **10 000 bytes** (UTF-8-safe).
 
-- **Request:** only the **latest** user message goes to `evaluate_prompt`
-  (not the whole conversation). If it exceeds 10 KB it is tail-trimmed to the
-  last 10 KB.
-- **Non-streaming response:** the full response is split into **10 KB sections
-  with a 100-byte overlap** and every section is evaluated, so a detection past
-  the first 10 KB isn't missed. BLOCK on any section → 400 for the whole
-  response; MASK across sections is reassembled best-effort.
-- **Streaming response:** chunks accumulate into a rolling 10 KB buffer and are
-  **held, not forwarded**, until the eval covering them returns ALLOW.
-  `evaluate_response` fires at most once per chunk, and only after at least
-  `WONDERFENCE_EVAL_BYTES_INCREMENT` bytes (default 200) have arrived since
-  the previous eval — so text reaches the client in ~200-byte bursts. A BLOCK
-  discards the held batch (those bytes never reach the user) and closes the
-  stream with a wire-format error frame (Anthropic SSE or OpenAI
-  `content_filter` chunk). MASK is unenforceable on a held batch: it logs a
-  WARN and the batch is released as-is.
+Text larger than 10 KB is split into **10 KB sections with a 100-byte overlap**
+and every section is evaluated in parallel, so a detection past the first 10 KB
+isn't missed. BLOCK on any section → 400 for the whole request/response; MASK
+across sections is reassembled best-effort.
 
-Tune with `WONDERFENCE_BUFFER_BYTES`, `WONDERFENCE_EVAL_BYTES_INCREMENT`, and
-`WONDERFENCE_RESPONSE_SECTION_OVERLAP_BYTES` in `~/.alice-litellm/.env`.
+- **Request:** only the **latest** user message goes to `evaluate_prompt`
+  (not the whole conversation), but **all** of it — nothing is trimmed. A large
+  `tool_result` therefore costs several parallel Alice calls before the LLM
+  request starts.
+- **Non-streaming response:** the full response, sectioned as above.
+- **Streaming response:** chunks are **held, not forwarded**, until the eval
+  covering them returns ALLOW. `evaluate_response` fires at most once per chunk,
+  and only after at least `WONDERFENCE_EVAL_BYTES_INCREMENT` bytes (default 200)
+  have arrived since the previous eval — so text reaches the client in ~200-byte
+  bursts. A BLOCK discards the held batch (those bytes never reach the user) and
+  closes the stream with a wire-format error frame (Anthropic SSE or OpenAI
+  `content_filter` chunk). MASK is unenforceable on a held batch: it logs a WARN
+  and the batch is released as-is.
+
+`WONDERFENCE_STREAM_EVAL_MODE` picks what each streaming eval carries:
+
+| Mode | Sent per eval | Trade-off |
+|---|---|---|
+| `deltas` (default) | the current + previous ~200-byte window (~400 B) | ~25× cheaper payload; misses a violation that only reads as one across a span longer than two windows |
+| `rolling` | the rolling 10 KB buffer | widest detection context; ~10 KB per call even though only ~200 bytes are new |
+| `accumulate_all` | the whole response, once | BLOCK **and** MASK enforceable, but no live tokens — the client waits for the full response |
+
+Tune the sizes with `WONDERFENCE_BUFFER_BYTES`, `WONDERFENCE_EVAL_BYTES_INCREMENT`,
+and `WONDERFENCE_RESPONSE_SECTION_OVERLAP_BYTES` in `~/.alice-litellm/.env`.
 
 Blocked requests return:
 
@@ -133,7 +143,12 @@ To use a different model, edit the relevant `litellm-config-*.yaml`.
 
 ### Per-request message dumps
 
-Every request/response is dumped (for debug / replay) to:
+Controlled by the guardrail's **`debug`** flag in `litellm-config-*.yaml` — the
+single switch for all guardrail debug output. `debug: true` writes every dump
+**and** prints the guardrail's DEBUG log lines; `debug: false` does neither.
+It is independent of `LITELLM_LOG`, which only governs LiteLLM's own logging.
+
+With `debug: true`, every request/response is dumped (for debug / replay) to:
 
 ```
 ~/.alice-litellm/messages/
@@ -145,8 +160,13 @@ one set per hook (`pre_call`, `during_call`, `post_call`, `post_call_stream`,
 (`*_chunks_text.jsonl`, `*_chunks_raw.jsonl`, `*_latest.txt`).
 
 Override the location with `WONDERFENCE_MESSAGES_DIR=/some/path` in
-`~/.alice-litellm/.env`, or set it to `/dev/null` to suppress dumps. The
-directory is auto-created and gitignored — clear it periodically if it grows.
+`~/.alice-litellm/.env`. The directory is auto-created and gitignored — clear it
+periodically if it grows. To turn dumps off, set `debug: false`.
+
+> Note: an inline `LITELLM_LOG=DEBUG ./start.sh` has no effect — `start.sh`
+> sources `~/.alice-litellm/.env` with `set -a`, so the file's value wins. Edit
+> the file to change LiteLLM's log level. The guardrail's own output doesn't
+> depend on it either way.
 
 ## Troubleshooting
 
