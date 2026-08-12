@@ -50,7 +50,7 @@ guardrails:
       fail_open: false
       block_message: "Content blocked by Alice WonderFence safety policy"
       default_on: true
-      debug: false
+      debug: true
 
 litellm_settings:
   drop_params: true

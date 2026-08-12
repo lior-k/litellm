@@ -93,13 +93,15 @@ The unit of text sent for evaluation is **10 000 bytes** (UTF-8-safe).
   with a 100-byte overlap** and every section is evaluated, so a detection past
   the first 10 KB isn't missed. BLOCK on any section → 400 for the whole
   response; MASK across sections is reassembled best-effort.
-- **Streaming response:** chunks accumulate into a rolling 10 KB buffer.
+- **Streaming response:** chunks accumulate into a rolling 10 KB buffer and are
+  **held, not forwarded**, until the eval covering them returns ALLOW.
   `evaluate_response` fires at most once per chunk, and only after at least
   `WONDERFENCE_EVAL_BYTES_INCREMENT` bytes (default 200) have arrived since
-  the previous eval. A mid-stream BLOCK closes the stream with a
-  wire-format error frame (Anthropic SSE or OpenAI `content_filter` chunk).
-  Mid-stream MASK is unenforceable for already-released text and logs a
-  WARN.
+  the previous eval — so text reaches the client in ~200-byte bursts. A BLOCK
+  discards the held batch (those bytes never reach the user) and closes the
+  stream with a wire-format error frame (Anthropic SSE or OpenAI
+  `content_filter` chunk). MASK is unenforceable on a held batch: it logs a
+  WARN and the batch is released as-is.
 
 Tune with `WONDERFENCE_BUFFER_BYTES`, `WONDERFENCE_EVAL_BYTES_INCREMENT`, and
 `WONDERFENCE_RESPONSE_SECTION_OVERLAP_BYTES` in `~/.alice-litellm/.env`.

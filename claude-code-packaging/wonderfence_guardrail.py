@@ -7,6 +7,7 @@ with LiteLLM to evaluate user prompts and LLM responses for content safety.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import os
@@ -39,6 +40,19 @@ EVAL_BYTES_INCREMENT = int(os.environ.get("WONDERFENCE_EVAL_BYTES_INCREMENT", "2
 RESPONSE_SECTION_OVERLAP_BYTES = int(
     os.environ.get("WONDERFENCE_RESPONSE_SECTION_OVERLAP_BYTES", "100")
 )
+RESPONSE_SECTION_MAX_CONCURRENCY = int(
+    os.environ.get("WONDERFENCE_RESPONSE_SECTION_CONCURRENCY", "10")
+)
+
+# Monotonic per-process counter so dump filenames sort by write order even when
+# timestamps collide at ms resolution (concurrent requests interleave).
+_dump_seq = itertools.count(1)
+
+
+def _seq_ts() -> str:
+    """Filename prefix `<date>-<time>-<ms>_<seq>` for dump files."""
+    ts = time.strftime("%Y%m%d-%H%M%S") + f"-{int((time.time() % 1) * 1000):03d}"
+    return f"{ts}_{next(_dump_seq):06d}"
 
 
 def _tail_bytes_utf8(text: str, max_bytes: int) -> str:
@@ -49,9 +63,7 @@ def _tail_bytes_utf8(text: str, max_bytes: int) -> str:
     return encoded[-max_bytes:].decode("utf-8", errors="ignore")
 
 
-def _split_overlapping_utf8(
-    text: str, max_bytes: int, overlap_bytes: int
-) -> list[str]:
+def _split_overlapping_utf8(text: str, max_bytes: int, overlap_bytes: int) -> list[str]:
     """Split `text` into <= `max_bytes` UTF-8 sections that overlap by
     `overlap_bytes`, so a detection straddling a section boundary isn't missed.
 
@@ -67,7 +79,9 @@ def _split_overlapping_utf8(
     start = 0
     n = len(encoded)
     while start < n:
-        sections.append(encoded[start : start + max_bytes].decode("utf-8", errors="ignore"))
+        sections.append(
+            encoded[start : start + max_bytes].decode("utf-8", errors="ignore")
+        )
         if start + max_bytes >= n:
             break
         start += step
@@ -95,7 +109,7 @@ class _RollingBuffer:
 
     def append_text(self, text: str) -> None:
         chunk = text.encode("utf-8")
-        self._buf = (self._buf + chunk)[-self.max_bytes:]
+        self._buf = (self._buf + chunk)[-self.max_bytes :]
         self._since_eval += len(chunk)
 
     def needs_eval(self) -> bool:
@@ -154,10 +168,10 @@ def _extract_session_id(data: Any) -> str | None:
 
 
 def _dump_request(hook_name: str, data: Any) -> None:
-    """Save full request data to messages/<ts>[_<session_id>]_<hook_name>.json."""
+    """Save full request data to messages/<ts>_<seq>[_<session_id>]_<hook_name>.json."""
     try:
         MESSAGES_DIR.mkdir(exist_ok=True)
-        ts = time.strftime("%Y%m%d-%H%M%S") + f"-{int((time.time() % 1) * 1000):03d}"
+        ts = _seq_ts()
         sid = _extract_session_id(data) or (
             _extract_session_id(data.get("data")) if isinstance(data, dict) else None
         )
@@ -165,14 +179,12 @@ def _dump_request(hook_name: str, data: Any) -> None:
         dest = MESSAGES_DIR / f"{ts}{sid_part}_{hook_name}.json"
         safe = _safe_serialize(data)
         dest.write_text(json.dumps(safe, indent=2, default=str))
-        print(f"[wonderfence] dumped {hook_name} -> {dest}", flush=True)
     except Exception as e:
-        print(f"[wonderfence] DUMP FAILED {hook_name}: {e!r}", flush=True)
-        logger.error("Failed to dump request for %s: %s", hook_name, e, exc_info=True)
+        logger.debug("Failed to dump request for %s: %s", hook_name, e, exc_info=True)
 
 
 def _dump_response_text(response: Any, tag: str = "response_text") -> None:
-    """Save plain-text LLM response content to messages/<ts>_<tag>.txt."""
+    """Save plain-text LLM response content to messages/<ts>_<seq>_<tag>.txt."""
     try:
         text = ""
         if hasattr(response, "choices") and response.choices:
@@ -182,69 +194,74 @@ def _dump_response_text(response: Any, tag: str = "response_text") -> None:
         if not text:
             return
         MESSAGES_DIR.mkdir(exist_ok=True)
-        ts = time.strftime("%Y%m%d-%H%M%S") + f"-{int((time.time() % 1) * 1000):03d}"
+        ts = _seq_ts()
         dest = MESSAGES_DIR / f"{ts}_{tag}.txt"
         dest.write_text(text)
-        print(f"[wonderfence] dumped {tag} -> {dest}", flush=True)
     except Exception as e:
-        print(f"[wonderfence] DUMP {tag} FAILED: {e!r}", flush=True)
+        logger.debug("Failed to dump %s: %s", tag, e, exc_info=True)
 
 
-def _dump_latest_user_message(data: Any, tag: str = "user_request") -> None:
-    """Save plain-text latest user message to messages/<ts>[_<sid>]_<tag>.txt."""
+def _dump_eval_text(text: str, tag: str, sid: str | None = None) -> None:
+    """Save the EXACT text sent to WonderFence to messages/<ts>_<seq>[_<sid>]_<tag>.txt.
+
+    `tag` is `<event>_eval_prompt` or `<event>_eval_response`. Unlike the
+    request/response dumps, this is post-flattening and post-trimming — byte-for-byte
+    what evaluate_prompt/evaluate_response receives.
+    """
     try:
-        if not isinstance(data, dict):
-            return
-        text = ""
-        for message in reversed(data.get("messages", []) or []):
-            if message.get("role") != "user":
-                continue
-            content = message.get("content", "")
-            if isinstance(content, str):
-                text = content
-            elif isinstance(content, list):
-                parts = []
-                for block in content:
-                    if isinstance(block, dict):
-                        if block.get("type") == "text":
-                            parts.append(block.get("text", ""))
-                        elif block.get("type") == "tool_result":
-                            tr = block.get("content", "")
-                            if isinstance(tr, str):
-                                parts.append(f"[tool_result] {tr}")
-                            elif isinstance(tr, list):
-                                for sub in tr:
-                                    if isinstance(sub, dict) and sub.get("type") == "text":
-                                        parts.append(f"[tool_result] {sub.get('text', '')}")
-                    elif isinstance(block, str):
-                        parts.append(block)
-                text = "\n".join(parts)
-            else:
-                text = str(content)
-            break
         if not text:
             return
         MESSAGES_DIR.mkdir(exist_ok=True)
-        ts = time.strftime("%Y%m%d-%H%M%S") + f"-{int((time.time() % 1) * 1000):03d}"
-        sid = _extract_session_id(data)
         sid_part = f"_{sid}" if sid else ""
-        dest = MESSAGES_DIR / f"{ts}{sid_part}_{tag}.txt"
+        dest = MESSAGES_DIR / f"{_seq_ts()}{sid_part}_{tag}.txt"
         dest.write_text(text)
-        print(f"[wonderfence] dumped {tag} -> {dest}", flush=True)
     except Exception as e:
-        print(f"[wonderfence] DUMP {tag} FAILED: {e!r}", flush=True)
+        logger.debug("Failed to dump %s: %s", tag, e, exc_info=True)
 
 
-def _make_chunk_log_paths(sid: str | None) -> tuple[Path, Path, Path]:
-    """Return (text_path, raw_path, latest_path) for current streaming request.
-    Filenames mirror _dump_request datetime-first scheme."""
+def _append_eval_buffer(
+    path: Path, index: int, buffer_text: str, final: bool = False
+) -> None:
+    """Append one entry per eval call: the rolling buffer sent to WonderFence.
+
+    One `eval-NN` block per evaluate_response call, not per Claude chunk — the
+    buffer is the ~10K rolling window, so each entry is written on its own lines.
+    """
+    try:
+        tag = f"eval-{index:02d}{' (final tail)' if final else ''}"
+        with path.open("a") as f:
+            f.write(
+                f"===== {tag} — {len(buffer_text)} chars "
+                f"({len(buffer_text.encode('utf-8'))} bytes) =====\n"
+                f"{buffer_text}\n\n"
+            )
+    except Exception as e:
+        logger.debug("Failed to append eval buffer %d: %s", index, e, exc_info=True)
+
+
+def _make_chunk_log_paths(sid: str | None) -> tuple[Path, Path, Path, Path]:
+    """Return (text_path, raw_path, response_full_path, eval_buffers_path) for the
+    current streaming request. Filenames mirror _dump_request datetime-first scheme.
+
+    Each file takes its own sequence number, assigned in the order the files are
+    listed here: raw wire events first, then extracted per-chunk text, then the
+    assembled response, then the eval inputs.
+    """
     MESSAGES_DIR.mkdir(exist_ok=True)
-    ts = time.strftime("%Y%m%d-%H%M%S") + f"-{int((time.time() % 1) * 1000):03d}"
     sid_part = f"_{sid}" if sid else ""
-    text = MESSAGES_DIR / f"{ts}{sid_part}_chunks_text.jsonl"
-    raw = MESSAGES_DIR / f"{ts}{sid_part}_chunks_raw.jsonl"
-    latest = MESSAGES_DIR / f"{ts}{sid_part}_latest.txt"
-    return text, raw, latest
+    raw = MESSAGES_DIR / f"{_seq_ts()}{sid_part}_post_call_stream_chunks_raw.jsonl"
+    text = MESSAGES_DIR / f"{_seq_ts()}{sid_part}_post_call_stream_chunks_text.jsonl"
+    # Every chunk's text, appended as it arrives — logged before the eval runs, so
+    # this holds the COMPLETE response Claude produced, including any chunks the
+    # gate later withheld from the user.
+    response_full = (
+        MESSAGES_DIR / f"{_seq_ts()}{sid_part}_post_call_stream_response_full.txt"
+    )
+    # One entry per eval call: the rolling buffer sent to Alice (eval-01, eval-02…).
+    eval_buffers = (
+        MESSAGES_DIR / f"{_seq_ts()}{sid_part}_post_call_stream_eval_chunks.txt"
+    )
+    return text, raw, response_full, eval_buffers
 
 
 def _serialize_chunk_raw(chunk: Any) -> str:
@@ -262,7 +279,7 @@ def _serialize_chunk_raw(chunk: Any) -> str:
 
 
 def _log_chunk(
-    idx: int, chunk: Any, text_path: Path, raw_path: Path, latest_path: Path
+    idx: int, chunk: Any, text_path: Path, raw_path: Path, response_full_path: Path
 ) -> None:
     """Append one line to each per-request log + append running text + print to stdout.
     Best effort."""
@@ -274,7 +291,7 @@ def _log_chunk(
         with raw_path.open("a") as f:
             f.write(json.dumps({"i": idx, "raw": raw}) + "\n")
         if text:
-            with latest_path.open("a") as f:
+            with response_full_path.open("a") as f:
                 f.write(text)
         print(f"[wonderfence] chunk[{idx}]: {text!r}", flush=True)
     except Exception as e:
@@ -337,8 +354,7 @@ class WonderFenceGuardrail(CustomGuardrail):
         debug: bool = False,
         max_cached_clients: int | None = None,
         connection_pool_limit: int | None = None,
-        stream_buffer_replacements: bool | None = None,
-        stream_buffer_eval: bool | None = None,
+        eval_mode_accumulate_all: bool | None = None,
         **kwargs: Any,
     ) -> None:
         self.api_key = api_key or os.environ.get("WONDERFENCE_API_KEY")
@@ -350,17 +366,24 @@ class WonderFenceGuardrail(CustomGuardrail):
         self.fail_open = fail_open
 
         def _env_bool(name: str) -> bool:
-            return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+            return os.environ.get(name, "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
 
-        self.stream_buffer_replacements = (
-            stream_buffer_replacements
-            if stream_buffer_replacements is not None
-            else _env_bool("WONDERFENCE_STREAM_BUFFER_REPLACEMENTS")
-        )
-        self.stream_buffer_eval = (
-            stream_buffer_eval
-            if stream_buffer_eval is not None
-            else _env_bool("WONDERFENCE_STREAM_BUFFER_EVAL")
+        # Streaming response mode. False (default): gated rolling-buffer mode —
+        # the response is evaluated on a rolling 10K buffer every ~200 chars and
+        # chunks are held until the eval covering them returns ALLOW, so a BLOCK
+        # is caught before the offending bytes reach the user (MASK/text
+        # replacements still can't be applied). True: accumulate the entire
+        # response, evaluate it once, then re-stream — slower (no live tokens)
+        # but BLOCK and MASK/replacements are fully enforceable.
+        self.eval_mode_accumulate_all = (
+            eval_mode_accumulate_all
+            if eval_mode_accumulate_all is not None
+            else _env_bool("WONDERFENCE_EVAL_MODE_ACCUMULATE_ALL")
         )
 
         if debug:
@@ -404,7 +427,9 @@ class WonderFenceGuardrail(CustomGuardrail):
             try:
                 await evicted_client.close()
             except Exception:
-                logger.warning("Failed to close evicted WonderFence client", exc_info=True)
+                logger.warning(
+                    "Failed to close evicted WonderFence client", exc_info=True
+                )
         return client
 
     def _resolve_app_id(
@@ -490,9 +515,7 @@ class WonderFenceGuardrail(CustomGuardrail):
             AnalysisContext instance for WonderFence SDK
         """
         metadata = (
-            request_data.get("metadata")
-            or request_data.get("litellm_metadata")
-            or {}
+            request_data.get("metadata") or request_data.get("litellm_metadata") or {}
         )
         model_str = request_data.get("model", "")
 
@@ -531,36 +554,39 @@ class WonderFenceGuardrail(CustomGuardrail):
             platform=self.platform,
         )
 
-    def _extract_user_message(self, data: dict[str, Any]) -> str:
-        """Extract the latest user message from request data.
+    @staticmethod
+    def _is_harness_block(text: str) -> bool:
+        """True if a text block is Claude Code scaffolding, not user content.
 
-        Args:
-            data: Request data containing messages array
+        Claude Code packs CLAUDE.md, tool/skill listings, IDE context and local
+        slash-command output into the user message as tagged text blocks. They
+        dwarf the real prompt (~50KB vs ~100B), so evaluating them wastes the
+        10KB budget and lets an injection in an early block fall outside the
+        tail-trim.
 
-        Returns:
-            Content of the latest user message, or empty string if not found
+        Matching is whole-block only (starts with the open tag AND ends with the
+        matching close tag): a `<system-reminder>` string appearing *inside*
+        fetched content must never be able to hide that content from the eval.
         """
-        messages = data.get("messages", [])
-        for message in reversed(messages):
-            if message.get("role") == "user":
-                content = message.get("content", "")
-                if isinstance(content, str):
-                    return content
-                if isinstance(content, list):
-                    parts = []
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            parts.append(block.get("text", ""))
-                        elif isinstance(block, str):
-                            parts.append(block)
-                    return "\n".join(parts)
-                return str(content)
-        return ""
+        stripped = text.strip()
+        for tag in ("system-reminder", "local-command-caveat", "local-command-stdout"):
+            if stripped.startswith(f"<{tag}>") and stripped.endswith(f"</{tag}>"):
+                return True
+        # The /slash-command trio arrives as one block of adjacent elements.
+        if stripped.startswith("<command-name>") and stripped.endswith(
+            ("</command-args>", "</command-message>", "</command-name>")
+        ):
+            return True
+        return False
 
     @staticmethod
     def _message_text(message: dict[str, Any]) -> str:
         """Flatten a single user-role message to plain text (string, text blocks,
-        tool_result blocks). Mirrors _dump_latest_user_message coverage."""
+        tool_result blocks), dropping Claude Code harness scaffolding blocks.
+
+        tool_result blocks are always kept — they carry fetched pages, file
+        contents and command output, which is where injected content arrives.
+        """
         content = message.get("content", "")
         if isinstance(content, str):
             return content
@@ -569,7 +595,10 @@ class WonderFenceGuardrail(CustomGuardrail):
             for block in content:
                 if isinstance(block, dict):
                     if block.get("type") == "text":
-                        parts.append(block.get("text", "") or "")
+                        text = block.get("text", "") or ""
+                        if WonderFenceGuardrail._is_harness_block(text):
+                            continue
+                        parts.append(text)
                     elif block.get("type") == "tool_result":
                         tr = block.get("content", "")
                         if isinstance(tr, str):
@@ -585,10 +614,10 @@ class WonderFenceGuardrail(CustomGuardrail):
             return "\n".join(parts)
         return str(content) if content else ""
 
-    def _collect_user_buffer(self, data: dict[str, Any]) -> str:
-        """Return the latest user message text, UTF-8-trimmed to BUFFER_MAX_BYTES.
+    def _collect_user_text_full(self, data: dict[str, Any]) -> str:
+        """Return the latest user message text, flattened but NOT trimmed.
 
-        Only the most recent user-role message is sent to WonderFence — not the
+        Only the most recent user-role message is considered — not the
         concatenated history. Handles string content, text blocks, and
         tool_result blocks. If the newest user message has no text, scans older
         ones until it finds text (e.g. an image-only turn is skipped).
@@ -600,7 +629,7 @@ class WonderFenceGuardrail(CustomGuardrail):
             text = self._message_text(message)
             if not text:
                 continue
-            return _tail_bytes_utf8(text, BUFFER_MAX_BYTES)
+            return text
         return ""
 
     def _extract_response_content(self, response: ModelResponse) -> str:
@@ -658,7 +687,11 @@ class WonderFenceGuardrail(CustomGuardrail):
         if action == Actions.BLOCK.value:
             logger.warning(
                 "WonderFence BLOCKED %s: wonderfence_correlation_id=%s evaluation_type=[%s], detections=[%s] content=%s...",
-                evaluation_type, correlation_id, evaluation_type, detection_summary, content[:100],
+                evaluation_type,
+                correlation_id,
+                evaluation_type,
+                detection_summary,
+                content[:100],
             )
             raise HTTPException(
                 status_code=400,
@@ -674,24 +707,33 @@ class WonderFenceGuardrail(CustomGuardrail):
             if action_text:
                 logger.warning(
                     "WonderFence MASKED %s: wonderfence_correlation_id=%s detections=[%s]",
-                    evaluation_type, correlation_id, detection_summary,
+                    evaluation_type,
+                    correlation_id,
+                    detection_summary,
                 )
                 return action_text
             logger.warning(
                 "WonderFence returned MASK action without action_text for %s: "
                 "wonderfence_correlation_id=%s detections=[%s]",
-                evaluation_type, correlation_id, detection_summary,
+                evaluation_type,
+                correlation_id,
+                detection_summary,
             )
 
         if action == Actions.DETECT.value:
             logger.warning(
                 "WonderFence DETECTED violation in %s: wonderfence_correlation_id=%s detections=[%s] content=%s...",
-                evaluation_type, correlation_id, detection_summary, content[:100],
+                evaluation_type,
+                correlation_id,
+                detection_summary,
+                content[:100],
             )
         else:
             logger.debug(
                 "WonderFence ALLOWED %s: wonderfence_correlation_id=%s detections=[%s]",
-                evaluation_type, correlation_id, detection_summary,
+                evaluation_type,
+                correlation_id,
+                detection_summary,
             )
 
         return content
@@ -749,9 +791,26 @@ class WonderFenceGuardrail(CustomGuardrail):
             SafetyCheckUnavailable: If evaluation fails
         """
         try:
-            prompt_buffer = self._collect_user_buffer(data)
+            sid = _extract_session_id(data)
+            full_text = self._collect_user_text_full(data)
+            prompt_buffer = _tail_bytes_utf8(full_text, BUFFER_MAX_BYTES)
+            # Full flattened message before the 10K tail-trim — diff against
+            # *_eval_prompt.txt to see exactly what the trim dropped.
+            _dump_eval_text(full_text, f"{hook_name}_prompt_full", sid)
+            if prompt_buffer != full_text:
+                logger.debug(
+                    "WonderFence %s: prompt trimmed for eval, %d → %d bytes "
+                    "(full text dumped to *_%s_prompt_full.txt)",
+                    hook_name,
+                    len(full_text.encode("utf-8")),
+                    len(prompt_buffer.encode("utf-8")),
+                    hook_name,
+                )
+            _dump_eval_text(prompt_buffer, f"{hook_name}_eval_prompt", sid)
             if not prompt_buffer:
-                logger.debug("WonderFence %s: no user message found, skipping", hook_name)
+                logger.debug(
+                    "WonderFence %s: no user message found, skipping", hook_name
+                )
                 return data
 
             api_key = self._resolve_api_key(data, user_api_key_dict)
@@ -759,6 +818,11 @@ class WonderFenceGuardrail(CustomGuardrail):
             client = await self._get_client(api_key)
             context = self._build_analysis_context(data)
 
+            print(
+                f"[wonderfence] {hook_name} → evaluate_prompt: {len(prompt_buffer)} chars "
+                f"({len(prompt_buffer.encode('utf-8'))} bytes) sent to Alice",
+                flush=True,
+            )
             logger.debug(
                 "WonderFence %s sending to evaluate_prompt (app_id=%s, context=%s, len=%d): %s",
                 hook_name,
@@ -813,6 +877,7 @@ class WonderFenceGuardrail(CustomGuardrail):
         Bedrock) and whitespace-only text blocks. Sanitizes nested tool_result
         content arrays.
         """
+
         def _is_empty_text_block(b: Any) -> bool:
             if not isinstance(b, dict):
                 return False
@@ -867,12 +932,12 @@ class WonderFenceGuardrail(CustomGuardrail):
         """Evaluate user prompt before sending to LLM."""
         logger.debug(
             "async_pre_call_hook called: user_api_key_dict=%s cache=%s data=%s call_type=%s",
-            user_api_key_dict, cache, data, call_type,
+            user_api_key_dict,
+            cache,
+            data,
+            call_type,
         )
-        _dump_request("pre_call", data)
-        _dump_latest_user_message(data, "user_request_before")
-        data = self._apply_pre_call_replacements_to_data(data)
-        _dump_latest_user_message(data, "user_request_after")
+        _dump_request("pre_call_request", data)
         data = self._sanitize_messages(data)
         _dump_request("pre_call_sanitized", data)
         return await self._evaluate_prompt(data, user_api_key_dict, "pre_call")
@@ -886,9 +951,11 @@ class WonderFenceGuardrail(CustomGuardrail):
         """Evaluate user prompt in parallel with the LLM call (during_call hook)."""
         logger.debug(
             "async_moderation_hook called: data=%s user_api_key_dict=%s call_type=%s",
-            data, user_api_key_dict, call_type,
+            data,
+            user_api_key_dict,
+            call_type,
         )
-        _dump_request("during_call", data)
+        _dump_request("during_call_request", data)
         return await self._evaluate_prompt(data, user_api_key_dict, "during_call")
 
     async def async_post_call_success_hook(
@@ -913,10 +980,11 @@ class WonderFenceGuardrail(CustomGuardrail):
         """
         logger.debug(
             "async_post_call_success_hook called: user_api_key_dict=%s data=%s response=%s",
-            user_api_key_dict, data, response,
+            user_api_key_dict,
+            data,
+            response,
         )
-        _dump_request("post_call", {"data": data, "response": str(response)})
-        _dump_response_text(response, "response_text_before")
+        _dump_request("post_call_request", {"data": data, "response": str(response)})
         try:
             logger.debug("WonderFence post_call started")
             response_content = self._extract_response_content(response)
@@ -932,14 +1000,8 @@ class WonderFenceGuardrail(CustomGuardrail):
 
             if modified_content != response_content:
                 response.choices[0].message.content = modified_content
+                _dump_response_text(response, "post_call_response_masked")
 
-            current = self._extract_response_content(response)
-            replaced = self._apply_post_call_replacements(current)
-            if replaced != current:
-                response.choices[0].message.content = replaced
-                logger.debug("WonderFence post_call: applied post-call string replacements")
-
-            _dump_response_text(response, "response_text_after")
             _dump_request("post_call_final", {"data": data, "response": str(response)})
             return response
 
@@ -953,27 +1015,55 @@ class WonderFenceGuardrail(CustomGuardrail):
         data: dict[str, Any],
         user_api_key_dict: UserAPIKeyAuth,
         hook_name: str,
+        chunk_count: int | None = None,
     ) -> str:
         """Send response text to WonderFence and return possibly-modified content.
 
         Responses larger than BUFFER_MAX_BYTES are split into overlapping
-        sections (overlap = RESPONSE_SECTION_OVERLAP_BYTES) and each section is
-        evaluated, so detections past the first 10K aren't missed. A BLOCK on
-        any section raises (blocks the whole response). MASK across multiple
-        sections is reassembled best-effort.
+        sections (overlap = RESPONSE_SECTION_OVERLAP_BYTES) and evaluated
+        concurrently (bounded by RESPONSE_SECTION_MAX_CONCURRENCY), so
+        detections past the first 10K aren't missed. A BLOCK on any section
+        raises (blocks the whole response). MASK across multiple sections is
+        reassembled best-effort.
         """
         api_key = self._resolve_api_key(data, user_api_key_dict)
         app_id = self._resolve_app_id(data, user_api_key_dict)
         client = await self._get_client(api_key)
         context = self._build_analysis_context(data)
 
+        # One-shot evals get their exact input dumped. The rolling/gated stream
+        # evals fire every ~200 bytes — dumping each would mean dozens of files
+        # per request, and their input is already accumulated in the running
+        # post_call_stream_eval_response.txt.
+        if "rolling" not in hook_name and "gated" not in hook_name:
+            _dump_eval_text(
+                response_content,
+                f"{hook_name}_eval_response",
+                _extract_session_id(data),
+            )
+
         sections = _split_overlapping_utf8(
             response_content, BUFFER_MAX_BYTES, RESPONSE_SECTION_OVERLAP_BYTES
+        )
+        sent_chars = sum(len(s) for s in sections)
+        sent_bytes = sum(len(s.encode("utf-8")) for s in sections)
+        chunk_note = (
+            f" from {chunk_count} stream chunks" if chunk_count is not None else ""
+        )
+        print(
+            f"[wonderfence] {hook_name} → evaluate_response: {sent_chars} chars "
+            f"({sent_bytes} bytes) sent to Alice in {len(sections)} Alice call(s){chunk_note} "
+            f"[content={len(response_content)} chars]",
+            flush=True,
         )
         logger.debug(
             "WonderFence %s sending to evaluate_response "
             "(app_id=%s, context=%s, len=%d, sections=%d)",
-            hook_name, app_id, context, len(response_content), len(sections),
+            hook_name,
+            app_id,
+            context,
+            len(response_content),
+            len(sections),
         )
 
         if len(sections) == 1:
@@ -982,84 +1072,44 @@ class WonderFenceGuardrail(CustomGuardrail):
             )
             return self._handle_evaluation_result(result, "response", sections[0])
 
-        handled_parts: list[str] = []
-        masked_any = False
-        for i, section in enumerate(sections):
-            logger.debug(
-                "WonderFence %s evaluate_response section %d/%d (len=%d)",
-                hook_name, i + 1, len(sections), len(section),
-            )
-            result = await client.evaluate_response(
-                app_id=app_id, response=section, context=context, custom_fields=None
-            )
-            handled = self._handle_evaluation_result(result, "response", section)
-            if handled != section:
-                masked_any = True
-            handled_parts.append(handled)
+        sem = asyncio.Semaphore(RESPONSE_SECTION_MAX_CONCURRENCY)
 
-        if not masked_any:
+        async def _eval_section(i: int, section: str) -> str:
+            async with sem:
+                logger.debug(
+                    "WonderFence %s evaluate_response section %d/%d (len=%d)",
+                    hook_name,
+                    i + 1,
+                    len(sections),
+                    len(section),
+                )
+                result = await client.evaluate_response(
+                    app_id=app_id, response=section, context=context, custom_fields=None
+                )
+                # Raises HTTPException on BLOCK — gather propagates it, blocking
+                # the whole response.
+                return self._handle_evaluation_result(result, "response", section)
+
+        # gather preserves order, so handled_parts aligns with sections.
+        handled_parts = await asyncio.gather(
+            *(_eval_section(i, s) for i, s in enumerate(sections))
+        )
+
+        if all(h == s for h, s in zip(handled_parts, sections)):
             return response_content
 
         logger.warning(
             "WonderFence %s: MASK across %d sections — reassembling best-effort "
             "(overlap=%d bytes)",
-            hook_name, len(sections), RESPONSE_SECTION_OVERLAP_BYTES,
+            hook_name,
+            len(sections),
+            RESPONSE_SECTION_OVERLAP_BYTES,
         )
         reassembled = handled_parts[0]
         for part in handled_parts[1:]:
             trimmed = part.encode("utf-8")[RESPONSE_SECTION_OVERLAP_BYTES:]
             reassembled += trimmed.decode("utf-8", errors="ignore")
         return reassembled
-
-    @staticmethod
-    def _apply_post_call_replacements(text: str) -> str:
-        return text
-
-    @staticmethod
-    def _apply_pre_call_replacements(text: str) -> str:
-        return text
-
-    @staticmethod
-    def _apply_pre_call_replacements_to_data(data: dict[str, Any]) -> dict[str, Any]:
-        """Rewrite ALL messages in-place using pre_call replacements (all roles)."""
-        repl = WonderFenceGuardrail._apply_pre_call_replacements
-        for message in data.get("messages", []) or []:
-            content = message.get("content")
-            if isinstance(content, str):
-                message["content"] = repl(content)
-            elif isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        block["text"] = repl(block.get("text", ""))
-        return data
-
-    @staticmethod
-    def _replacement_overlap() -> int:
-        """Max chars to hold back between chunks to catch cross-boundary patterns."""
-        return max(len("Lior"), len("King")) - 1  # 3
-
-    @staticmethod
-    def _set_chunk_text(chunk: Any, text: str) -> None:
-        """Set delta.content on a ModelResponseStream chunk (in-place)."""
-        try:
-            chunk.choices[0].delta.content = text
-        except (AttributeError, IndexError, TypeError):
-            pass
-
-    @staticmethod
-    def _apply_replacements_to_chunk(chunk: Any) -> Any:
-        """Per-chunk replacement (no cross-boundary awareness). Used for bytes
-        chunks and the buffered path."""
-        if isinstance(chunk, (bytes, bytearray)):
-            return bytes(chunk).replace(b"Lior", b"Tali").replace(b"King", b"Queen")
-        try:
-            delta = chunk.choices[0].delta
-            content = getattr(delta, "content", None)
-            if isinstance(content, str) and content:
-                delta.content = WonderFenceGuardrail._apply_post_call_replacements(content)
-        except (AttributeError, IndexError, TypeError):
-            pass
-        return chunk
 
     @staticmethod
     def _extract_chunk_text(chunk: Any) -> str:
@@ -1075,23 +1125,129 @@ class WonderFenceGuardrail(CustomGuardrail):
             pass
         return ""
 
-    def _build_block_frames(self, is_bytes_format: bool) -> list[Any]:
+    @staticmethod
+    def _track_open_block(chunk: Any, state: dict[str, int | None]) -> None:
+        """Update client-visible content-block state as a chunk is RELEASED.
+
+        `state` holds "open" (index of the block currently open on the client,
+        or None) and "max" (highest content_block index started so far, -1 if
+        none). Used by the gated path to aim the BLOCK frame at the right index
+        instead of a hardcoded 0. No-op for non-bytes chunks.
+        """
+        if not isinstance(chunk, (bytes, bytearray)):
+            return
+        raw = bytes(chunk).decode("utf-8", errors="replace")
+        for line in raw.split("\n"):
+            line = line.strip()
+            if not line.startswith("data: "):
+                continue
+            try:
+                d = json.loads(line[6:])
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(d, dict):
+                continue
+            t = d.get("type")
+            if t == "content_block_start":
+                idx = d.get("index", 0)
+                state["open"] = idx
+                if idx > (state["max"] if state["max"] is not None else -1):
+                    state["max"] = idx
+            elif t == "content_block_stop":
+                if state["open"] == d.get("index", 0):
+                    state["open"] = None
+
+    def _build_block_frames(
+        self,
+        is_bytes_format: bool,
+        released_any: bool,
+        open_index: int | None,
+        next_index: int,
+    ) -> list[Any]:
         """Wire-format BLOCK frame(s) for mid-stream injection.
 
-        - bytes (Anthropic SSE): one content_block_delta with block_message
-          + one message_stop, joined as a single byte chunk.
-        - ModelResponseStream (OpenAI-style): one chunk with delta.content
-          set to block_message and finish_reason="content_filter".
+        - bytes (Anthropic SSE), released_any=True: close the client's open
+          content block (open_index, if any) and open a fresh text block at
+          next_index for the block_message (content_block_stop →
+          content_block_start(text) → content_block_delta → content_block_stop →
+          message_delta → message_stop). Required because with extended thinking
+          the open block is a later index (e.g. 1), so a bare delta at index 0
+          targets the already-stopped thinking block and the client rejects it.
+        - bytes (Anthropic SSE), released_any=False (nothing streamed yet — the
+          held batch still contains message_start): a complete minimal valid
+          message (message_start → content_block_start → content_block_delta →
+          content_block_stop → message_delta → message_stop) so the client
+          isn't handed a bare delta with no message envelope.
+        - ModelResponseStream (OpenAI-style): one chunk with delta.content set
+          to block_message and finish_reason="content_filter" — self-contained
+          either way.
+        All bytes variants are joined into a single byte chunk.
         """
         if is_bytes_format:
+            stop_event = {"type": "message_stop"}
+            msg_delta = {
+                "type": "message_delta",
+                "delta": {"stop_reason": "stop_sequence", "stop_sequence": None},
+                "usage": {"output_tokens": 0},
+            }
+            if released_any:
+                idx = next_index
+                delta_event = {
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": {"type": "text_delta", "text": self.block_message},
+                }
+                block_start = {
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {"type": "text", "text": ""},
+                }
+                block_stop = {"type": "content_block_stop", "index": idx}
+                sse = ""
+                if open_index is not None:
+                    close_open = {"type": "content_block_stop", "index": open_index}
+                    sse += (
+                        f"event: content_block_stop\ndata: {json.dumps(close_open)}\n\n"
+                    )
+                sse += (
+                    f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n"
+                    f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+                    f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n"
+                    f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n"
+                    f"event: message_stop\ndata: {json.dumps(stop_event)}\n\n"
+                )
+                return [sse.encode("utf-8")]
+
             delta_event = {
                 "type": "content_block_delta",
                 "index": 0,
                 "delta": {"type": "text_delta", "text": self.block_message},
             }
-            stop_event = {"type": "message_stop"}
+            start_event = {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_wonderfence_block",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "",
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                },
+            }
+            block_start = {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            }
+            block_stop = {"type": "content_block_stop", "index": 0}
             sse = (
+                f"event: message_start\ndata: {json.dumps(start_event)}\n\n"
+                f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n"
                 f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+                f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n"
+                f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n"
                 f"event: message_stop\ndata: {json.dumps(stop_event)}\n\n"
             )
             return [sse.encode("utf-8")]
@@ -1108,93 +1264,6 @@ class WonderFenceGuardrail(CustomGuardrail):
             ],
         )
         return [chunk]
-
-    async def _fire_and_forget_eval(
-        self,
-        text: str,
-        request_data: dict[str, Any],
-        user_api_key_dict: UserAPIKeyAuth,
-        hook_name: str,
-    ) -> None:
-        """Run WonderFence eval without enforcing BLOCK/MASK (already streamed)."""
-        try:
-            await self._evaluate_response_text(text, request_data, user_api_key_dict, hook_name)
-        except HTTPException as e:
-            logger.warning(
-                "WonderFence %s (fire-and-forget) would BLOCK but stream already released: %s",
-                hook_name, e.detail,
-            )
-        except Exception as e:
-            logger.error("WonderFence %s (fire-and-forget) failed: %s", hook_name, e)
-
-    @staticmethod
-    def _apply_replacements_to_sse_bytes(chunks: list[bytes]) -> list[bytes]:
-        """Rewrite Anthropic SSE so post-call replacements survive cross-delta splits.
-
-        Text deltas are buffered per content_block index, joined, run through
-        `_apply_post_call_replacements`, then collapsed into a single text_delta
-        per block (emitted at the position of that block's first text_delta).
-        Subsequent text_deltas for the same block are dropped. Non-text events
-        pass through unchanged.
-        """
-        raw = b"".join(chunks).decode("utf-8", errors="replace")
-        events = raw.split("\n\n")
-        per_block_text: dict[int, str] = {}
-        per_block_first_idx: dict[int, int] = {}
-        parsed: list[tuple[str, Any]] = []  # (kind, payload)
-
-        for i, ev in enumerate(events):
-            if not ev.strip():
-                parsed.append(("raw", ev))
-                continue
-            data_line = None
-            for line in ev.split("\n"):
-                if line.startswith("data: "):
-                    data_line = line[6:]
-                    break
-            if data_line is None:
-                parsed.append(("raw", ev))
-                continue
-            try:
-                data = json.loads(data_line)
-            except (json.JSONDecodeError, ValueError):
-                parsed.append(("raw", ev))
-                continue
-            if (
-                isinstance(data, dict)
-                and data.get("type") == "content_block_delta"
-                and isinstance(data.get("delta"), dict)
-                and data["delta"].get("type") == "text_delta"
-            ):
-                idx = data.get("index", 0)
-                per_block_text.setdefault(idx, "")
-                per_block_text[idx] += data["delta"].get("text", "") or ""
-                if idx not in per_block_first_idx:
-                    per_block_first_idx[idx] = i
-                parsed.append(("text_delta", (idx, data)))
-            else:
-                parsed.append(("raw", ev))
-
-        replaced_text = {
-            idx: WonderFenceGuardrail._apply_post_call_replacements(t)
-            for idx, t in per_block_text.items()
-        }
-
-        out_events: list[str] = []
-        for i, (kind, payload) in enumerate(parsed):
-            if kind == "raw":
-                out_events.append(payload)
-                continue
-            idx, data = payload
-            if per_block_first_idx.get(idx) == i:
-                data["delta"]["text"] = replaced_text.get(idx, "")
-                out_events.append(
-                    f"event: content_block_delta\ndata: {json.dumps(data)}"
-                )
-            # subsequent text_deltas for same block are dropped
-
-        rebuilt = "\n\n".join(out_events)
-        return [rebuilt.encode("utf-8")]
 
     @staticmethod
     def _extract_text_from_sse_bytes(chunks: list[bytes]) -> str:
@@ -1220,130 +1289,204 @@ class WonderFenceGuardrail(CustomGuardrail):
                     texts.append(delta.get("text", ""))
         return "".join(texts)
 
-    async def async_post_call_streaming_iterator_hook(
+    async def async_post_call_streaming_iterator_hook(  # This is the litellm hook for streaming responses, which is called after the LLM has started streaming its response.
         self,
         user_api_key_dict: UserAPIKeyAuth,
         response: Any,
         request_data: dict,
     ) -> AsyncGenerator[Any, None]:
-        """Buffer streaming chunks, evaluate full response, then re-yield.
+        """Evaluate the streamed response, withholding chunks until they clear.
 
-        Two paths:
+        Default (eval_mode_accumulate_all=false): gated rolling-buffer mode —
+        hold chunks, eval a rolling 10K window every ~200 bytes, release the
+        held batch on ALLOW, discard it and inject a BLOCK frame otherwise.
+
+        eval_mode_accumulate_all=true: buffer everything, eval once, re-yield.
         - ModelResponseStream chunks (/v1/chat/completions): assemble via
-          stream_chunk_builder, run eval, re-stream via MockResponseIterator
-          (supports BLOCK + MASK).
-        - Raw SSE bytes (/v1/messages Anthropic): parse SSE, run eval, re-yield
-          original bytes (supports BLOCK only — can't reliably rebuild SSE for MASK).
+          stream_chunk_builder, re-stream via MockResponseIterator (BLOCK + MASK).
+        - Raw SSE bytes (/v1/messages Anthropic): parse SSE, re-yield original
+          bytes (BLOCK only — can't reliably rebuild SSE for MASK).
         """
         from litellm.llms.base_llm.base_model_iterator import MockResponseIterator
         from litellm.main import stream_chunk_builder
 
         sid = _extract_session_id(request_data)
-        text_path, raw_path, latest_path = _make_chunk_log_paths(sid)
-        print(
-            f"[wonderfence] chunk logs: text={text_path.name} raw={raw_path.name} "
-            f"latest={latest_path.name}",
-            flush=True,
+        text_path, raw_path, response_full_path, eval_buffers_path = (
+            _make_chunk_log_paths(sid)
         )
+        eval_idx = 0
 
-        if not self.stream_buffer_replacements:
+        if not self.eval_mode_accumulate_all:
             logger.debug(
-                "WonderFence post_call_stream: streaming rolling-buffer mode "
+                "WonderFence post_call_stream: gated rolling-buffer mode "
                 "(max_bytes=%d, increment=%d)",
-                BUFFER_MAX_BYTES, EVAL_BYTES_INCREMENT,
+                BUFFER_MAX_BYTES,
+                EVAL_BYTES_INCREMENT,
             )
             rb = _RollingBuffer(BUFFER_MAX_BYTES, EVAL_BYTES_INCREMENT)
+            pending: list[Any] = []  # buffered, not yet released, in order
+            released_any = False
             chunk_count = 0
-            is_bytes_format: bool | None = None
+            is_bytes_format = None
+            # Client-visible content-block state, updated only on release, so a
+            # BLOCK frame targets the block the client actually has open.
+            blockstate: dict[str, int | None] = {"open": None, "max": -1}
 
             async for chunk in response:
-                _log_chunk(chunk_count, chunk, text_path, raw_path, latest_path)
+                _log_chunk(chunk_count, chunk, text_path, raw_path, response_full_path)
                 chunk_count += 1
-
                 if is_bytes_format is None:
                     is_bytes_format = isinstance(chunk, (bytes, bytearray))
-
                 text = self._extract_chunk_text(chunk)
                 if text:
                     rb.append_text(text)
+                pending.append(chunk)
 
                 if rb.needs_eval():
+                    eval_idx += 1
+                    _append_eval_buffer(eval_buffers_path, eval_idx, rb.text())
                     try:
                         modified = await self._evaluate_response_text(
                             rb.text(),
                             request_data,
                             user_api_key_dict,
-                            "post_call_stream_rolling",
+                            "post_call_stream_gated",
+                            chunk_count=chunk_count,
                         )
                         if modified != rb.text():
                             logger.warning(
-                                "WonderFence post_call_stream_rolling: MASK requested "
-                                "mid-stream — already-released bytes unenforceable, "
-                                "passing chunk through"
+                                "WonderFence post_call_stream_gated: MASK requested "
+                                "mid-stream — unenforceable on gated batch, releasing "
+                                "chunks as-is"
                             )
+                        for c in pending:  # ALLOW → release the batch, in order
+                            self._track_open_block(c, blockstate)
+                            yield c
+                        released_any = True
+                        pending.clear()
                         rb.mark_evaluated()
-                    except HTTPException as e:
+                    except HTTPException as e:  # BLOCK → discard held batch
+                        blocked_text = "".join(
+                            self._extract_chunk_text(c) for c in pending
+                        )
+                        first_idx = chunk_count - len(pending)
+                        print(
+                            f"[wonderfence] BLOCKED & withheld chunks "
+                            f"{first_idx}..{chunk_count - 1} ({len(pending)} chunks, "
+                            f"{len(blocked_text)} chars): {blocked_text!r}",
+                            flush=True,
+                        )
                         logger.warning(
-                            "WonderFence post_call_stream_rolling: BLOCK mid-stream, "
-                            "injecting error frame. detail=%s",
+                            "WonderFence post_call_stream_gated: BLOCK, discarding "
+                            "%d held chunks (%d..%d): %r detail=%s",
+                            len(pending),
+                            first_idx,
+                            chunk_count - 1,
+                            blocked_text,
                             e.detail,
                         )
-                        for frame in self._build_block_frames(bool(is_bytes_format)):
+                        max_started = blockstate["max"]
+                        for frame in self._build_block_frames(
+                            bool(is_bytes_format),
+                            released_any,
+                            open_index=blockstate["open"],
+                            next_index=(max_started if max_started is not None else -1)
+                            + 1,
+                        ):
                             yield frame
                         return
-                    except Exception as e:  # noqa: BLE001
+                    except Exception as e:  # noqa: BLE001 — eval error → release
                         logger.error(
-                            "WonderFence post_call_stream_rolling eval failed (continuing): %s",
+                            "WonderFence post_call_stream_gated eval failed "
+                            "(releasing): %s",
                             e,
                         )
+                        for c in pending:
+                            self._track_open_block(c, blockstate)
+                            yield c
+                        released_any = True
+                        pending.clear()
                         rb.mark_evaluated()
 
-                yield chunk
-
-            if rb.pending_bytes() > 0:
+            # Stream ended with a sub-increment tail still held → now enforceable.
+            if pending and rb.pending_bytes() > 0:
+                eval_idx += 1
+                _append_eval_buffer(eval_buffers_path, eval_idx, rb.text(), final=True)
                 try:
                     await self._evaluate_response_text(
                         rb.text(),
                         request_data,
                         user_api_key_dict,
-                        "post_call_stream_rolling_final",
+                        "post_call_stream_gated_final",
+                        chunk_count=chunk_count,
                     )
+                    for c in pending:
+                        self._track_open_block(c, blockstate)
+                        yield c
                 except HTTPException as e:
+                    blocked_text = "".join(self._extract_chunk_text(c) for c in pending)
+                    first_idx = chunk_count - len(pending)
+                    print(
+                        f"[wonderfence] BLOCKED & withheld final chunks "
+                        f"{first_idx}..{chunk_count - 1} ({len(pending)} chunks, "
+                        f"{len(blocked_text)} chars): {blocked_text!r}",
+                        flush=True,
+                    )
                     logger.warning(
-                        "WonderFence post_call_stream_rolling_final: would BLOCK but "
-                        "stream already released. detail=%s",
+                        "WonderFence post_call_stream_gated_final: BLOCK, withholding "
+                        "chunks %d..%d: %r detail=%s",
+                        first_idx,
+                        chunk_count - 1,
+                        blocked_text,
                         e.detail,
                     )
+                    max_started = blockstate["max"]
+                    for frame in self._build_block_frames(
+                        bool(is_bytes_format),
+                        released_any,
+                        open_index=blockstate["open"],
+                        next_index=(max_started if max_started is not None else -1) + 1,
+                    ):
+                        yield frame
+                    return
                 except Exception as e:  # noqa: BLE001
                     logger.error(
-                        "WonderFence post_call_stream_rolling_final eval failed: %s", e
+                        "WonderFence post_call_stream_gated_final eval failed "
+                        "(releasing): %s",
+                        e,
                     )
+                    for c in pending:
+                        yield c
+            elif pending:  # textless tail (e.g. trailing SSE stop events) → release
+                for c in pending:
+                    yield c
 
-            print(
-                f"[wonderfence] post_call_stream (rolling): chunks={chunk_count} "
-                f"is_bytes={is_bytes_format}",
-                flush=True,
+            logger.debug(
+                "WonderFence post_call_stream (gated): chunks=%d is_bytes=%s",
+                chunk_count,
+                is_bytes_format,
             )
             return
 
         all_chunks: list[Any] = []
-        async for chunk in response:    # blocks till we have the full response
+        async for chunk in response:  # blocks till we have the full response
             all_chunks.append(chunk)
-            _log_chunk(len(all_chunks) - 1, chunk, text_path, raw_path, latest_path)
+            _log_chunk(
+                len(all_chunks) - 1, chunk, text_path, raw_path, response_full_path
+            )
 
-        is_bytes = bool(all_chunks) and all(isinstance(c, (bytes, bytearray)) for c in all_chunks)
+        is_bytes = bool(all_chunks) and all(
+            isinstance(c, (bytes, bytearray)) for c in all_chunks
+        )
         total_len = sum(
             len(c) if isinstance(c, (bytes, bytearray, str)) else len(str(c))
             for c in all_chunks
         )
-        print(
-            f"[wonderfence] post_call_stream: chunks={len(all_chunks)} "
-            f"total_len={total_len} is_bytes={is_bytes}",
-            flush=True,
-        )
         logger.debug(
             "async_post_call_streaming_iterator_hook called: chunks=%d total_len=%d is_bytes=%s",
-            len(all_chunks), total_len, is_bytes,
+            len(all_chunks),
+            total_len,
+            is_bytes,
         )
         if is_bytes:
             chunks_dump: Any = b"".join(all_chunks).decode("utf-8", errors="replace")
@@ -1369,7 +1512,10 @@ class WonderFenceGuardrail(CustomGuardrail):
                     logger.debug("WonderFence post_call_stream: no SSE text, skipping")
                 else:
                     modified = await self._evaluate_response_text(
-                        response_content, request_data, user_api_key_dict, "post_call_stream"
+                        response_content,
+                        request_data,
+                        user_api_key_dict,
+                        "post_call_stream",
                     )
                     if modified != response_content:
                         logger.warning(
@@ -1378,18 +1524,16 @@ class WonderFenceGuardrail(CustomGuardrail):
                         )
             except Exception as e:
                 self._handle_error(e, "post_call_stream")
-            logger.debug("WonderFence post_call_stream: applied post-call string replacements (SSE)")
-            final_chunks = self._apply_replacements_to_sse_bytes(all_chunks)
             _dump_request(
                 "post_call_stream_final",
                 {
                     "data": request_data,
-                    "chunk_count": len(final_chunks),
+                    "chunk_count": len(all_chunks),
                     "is_bytes": True,
-                    "chunks": b"".join(final_chunks).decode("utf-8", errors="replace"),
+                    "chunks": b"".join(all_chunks).decode("utf-8", errors="replace"),
                 },
             )
-            for chunk in final_chunks:
+            for chunk in all_chunks:
                 yield chunk
             return
 
@@ -1425,10 +1569,7 @@ class WonderFenceGuardrail(CustomGuardrail):
                 response_content, request_data, user_api_key_dict, "post_call_stream"
             )
 
-            final_content = self._apply_post_call_replacements(modified_content)
-            if final_content != modified_content:
-                logger.debug("WonderFence post_call_stream: applied post-call string replacements")
-
+            final_content = modified_content
             _dump_request(
                 "post_call_stream_final",
                 {
